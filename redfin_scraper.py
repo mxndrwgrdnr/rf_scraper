@@ -17,8 +17,8 @@ driver = webdriver.Chrome(chrome_options=chromeOptions)
 
 zcdb = ZipCodeDatabase()
 zips = [zc.zip for zc in zcdb.find_zip()]
-failures = []
-# zips = ['94609', '94110', '00501', '00210']
+timeouts = []
+not_listed = []
 
 for zc in zips:
 
@@ -28,7 +28,7 @@ for zc in zips:
 
     if driver.current_url == 'https://www.redfin.com/out-of-area-signup':
         print('no listings for ' + url)
-        failures.append(zc)
+        not_listed.append(zc)
 
     else:
         try:
@@ -38,10 +38,14 @@ for zc in zips:
             print "got " + zc
         except:
             print "timeout getting " + zc
-            failures.append(zc)
+            timeouts.append(zc)
 
     time.sleep(0.1)
 
-with open('failures.csv', 'wb') as f:
+with open('timeouts.csv', 'wb') as f:
     wr = csv.writer(f)
-    wr.writerows(failures)
+    wr.writerows(timeouts)
+
+with open('not_listed.csv', 'wb') as f:
+    wr = csv.writer(f)
+    wr.writerows(not_listed)
