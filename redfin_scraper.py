@@ -1,11 +1,12 @@
 from __future__ import division
 import csv
 from selenium import webdriver
-from pyvirtualdisplay import Display
+# from pyvirtualdisplay import Display
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.common.desired_capabilities import DesiredCapabilities
+from selenium.common.exceptions import NoSuchElementException
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.action_chains import ActionChains
 from pyzipcode import ZipCodeDatabase
@@ -13,18 +14,21 @@ from itertools import izip_longest
 from datetime import datetime as dt
 import pandas as pd
 import time
+import pickle
 
-display = Display(visible=0, size=(800, 600))
-display.start()
+# display = Display(visible=0, size=(1024, 768))
+# display.start()
 
 chrome_options = Options()
-chrome_options.add_extension("/home/mgardner/rf_scraper/proxy.zip")
+chrome_options.add_extension("./proxy.zip")
 chrome_options.add_argument('--ignore-certificate-errors')
+chrome_options.add_argument("window-size=1024,768")
 chrome_options.add_argument("--start-maximized")
 
-OUT_DIR = '/home/mgardner/rf_scraper/data/'
+OUT_DIR = './data/'
 zcdb = ZipCodeDatabase()
-zips = [zc.zip for zc in zcdb.find_zip()]
+# zips = [zc.zip for zc in zcdb.find_zip()]
+zips = ['94609']
 startDate = dt.now().strftime('%Y-%m-%d')
 
 with open('not_listed.csv', 'rb') as f:
@@ -32,22 +36,136 @@ with open('not_listed.csv', 'rb') as f:
     not_listed = [zc for zclist in reader for zc in zclist]
 
 
-def getChromeDriver(zipcode, chromeOptions=None):
+
+
+def getChromeDriver(chromeOptions=None):
     driver = webdriver.Chrome(chrome_options=chromeOptions)
     driver.implicitly_wait(10)
+    return driver
+
+
+def switchToTableView(driver):
+    try:
+        button = driver.find_element(
+            By.XPATH, '''//span[@data-rf-test-name="tableOption"]''')
+        button.click()
+        return
+    except:
+        return
+
+
+def checkForLoginPrompt(driver):
+    try:
+        loginPrompt = driver.find_element(
+            By.XPATH, '//div[@data-rf-test-name="dialog-close-button"]')
+        print('Detected login prompt. Will try to close.')
+    except:
+        return False
+    loginPrompt.click()
+    return True
+
+
+def checkForPopUp(driver):
+    try:
+        popup = driver.find_element(
+            By.XPATH,
+            '//a[@href="https://www.redfin.com' +
+            '/buy-a-home/classes-and-events"]')
+        popup.find_element(By.XPATH, '../../../img').click()
+        return
+    except NoSuchElementException:
+        return
+
+
+def checkForMap(driver):
+    noMap = True
+    while noMap:
+        try:
+            driver.find_element(
+                By.XPATH, '//div[@class="GoogleMapView"]')
+            noMap = False
+        except:
+            print('No map detected. Refreshing browser.')
+            driver.refresh()
+            time.sleep(5)
+    return
+
+
+def waitForProgressBar(driver):
+    try:
+        WebDriverWait(driver, 5).until(
+            EC.presence_of_element_located(
+                (By.XPATH,
+                    '//div[@data-rf-test-name="progress-bar-text"]')))
+    except:
+        print('Never any progress bar')
+        checkForMap(driver)
+        return
+    try:
+        WebDriverWait(driver, 30).until(
+            EC.invisibility_of_element_located(
+                (By.XPATH,
+                    '//div[@data-rf-test-name="progress-bar-text"]')))
+    except:
+        print('Timed out waiting for progress bar to finish.')
+        print('Refreshing browser.')
+        driver.refresh()
+    return
+
+
+def checkForFlyout(driver):
+    flyOut = True
+    try:
+        selectedRow = driver.find_element(
+            By.XPATH, '//tr[@class="selected tableRow"]')
+    except:
+        print('No rows detected. Refreshing browser.')
+        driver.refresh()
+        return
+    selectedRowNum = int(selectedRow.get_attribute('id').split('_')[1])
+    while flyOut:
+        try:
+            driver.find_element(
+                By.XPATH, '//div[@class="clickableHome MultiUnitFlyout"]')
+            print('Flyout menu detected')
+            nextRow = driver.find_element(
+                By.XPATH,
+                '//tr[@id="ReactDataTableRow_{0}"]'.format(selectedRowNum + 1))
+            print('Clicking next row to close flyout')
+            actions = ActionChains(driver)
+            actions.move_to_element(nextRow).perform()
+            nextRow.click()
+            print('Flyout should be gone.')
+            checkForLoginPrompt(driver)
+            selectedRowNum += 1
+        except NoSuchElementException:
+            flyOut = False
+    return
+
+
+def ensurePageReady(driver):
+    checkForLoginPrompt(driver)
+    waitForProgressBar(driver)
+    switchToTableView(driver)
+    checkForPopUp(driver)
+    checkForFlyout(driver)
+    return
+
+
+def goToRedfin(zipcode, chromeOptions=None):
+    driver = getChromeDriver(chromeOptions)
     zc = zipcode
     url = "http://www.redfin.com/zipcode/" + zc + \
         "/filter/include=sold-all"
     driver.get(url)
-    button = driver.find_element(
-        By.XPATH, '''//span[@data-rf-test-name="tableOption"]''')
-    button.click()
+    switchToTableView(driver)
+    ensurePageReady(driver)
     return driver
 
 
 def getClusters(driver):
     clusters = driver.find_elements(
-        By.XPATH, '//div[@class="clusterMarkerImage"]')
+        By.XPATH, '//div[@class="numHomes"]')
     return clusters
 
 
@@ -57,32 +175,117 @@ def getListingCount(driver):
     if 'of' in elemText:
         countStr = elemText.split('of')[1].split('Homes')[0].strip()
     else:
-        countStr = elemText.split()[0]
+        countStr = elemText.split()[1]
+    assert countStr.isdigit()
     return int(countStr)
 
 
-def getMainClusters(driver):
+def getSubClusters(driver, mainClusterDict, mainClusterNo):
+    i = mainClusterNo
+    mainClusterUrl = driver.current_url
+    totalCountFromSubClusters = 0
+    subClusters = getClusters(driver)
+    numSubClusters = len(subClusters)
+    mainClusterDict[i].update({'numSubClusters': numSubClusters})
+    subClusterDict = mainClusterDict[i]['subClusters']
+    count = mainClusterDict[i]['count']
+    origCount = count
+    subClustersUnder350 = []
+    subClustersOver350 = []
+    allUrls = []
+    for j in range(len(subClusters)):
+        if (j in subClusterDict.keys()) and (subClusterDict[j]['complete']):
+            continue
+        else:
+            if j not in subClusterDict.keys():
+                subClusterDict[j] = {'complete': False}
+        assert len(subClusters) == numSubClusters
+        assert driver.current_url == mainClusterUrl
+        assert origCount - 2 <= count <= origCount + 2
+        print('Clicking {0} of {1} subClusters in main cluster {2}'.format(
+            j + 1, len(subClusters), i + 1))
+        try:
+            subClusters[j].click()
+            subClusterDict[j].update({'clickable': True})
+            print('Subcluster {0}.{1} clicked!'.format(i + 1, j + 1))
+            ensurePageReady(driver)
+        except:
+            print('Could not click subcluster {0}.{1}.'.format(
+                i + 1, j + 1))
+            subClusterDict[j].update({'clickable': False})
+            continue
+        newCount = getListingCount(driver)
+        sttm = time.time()
+        while (newCount == count) and (time.time() - sttm < 30):
+            newCount = getListingCount(driver)
+        count = getListingCount(driver)
+        subClusterDict[j].update({'count': count, 'url': driver.current_url})
+        totalCountFromSubClusters += count
+        if count > 345:
+            print('Subcluster {0}.{1} has more than 350 listings'.format(
+                i + 1, j + 1))
+            subClustersOver350.append(j)
+            driver.get(mainClusterUrl)
+            ensurePageReady(driver)
+        else:
+            print('Subcluster {0}.{1} has less than 350 listings'.format(
+                i + 1, j + 1))
+            print('Getting listing urls for subcluster {0}.{1}'.format(
+                i + 1, j + 1))
+            listingUrls = getAllUrls(driver)
+            allUrls += listingUrls
+            assert count - 2 <= len(listingUrls) <= count + 2
+            subClusterDict[j].update({'listingUrls': listingUrls})
+            subClustersUnder350.append(j)
+            driver.get(mainClusterUrl)
+            ensurePageReady(driver)
+        subClusterDict[j]['complete'] = True
+        newCount = getListingCount(driver)
+        sttm = time.time()
+        while (newCount == count) and (time.time() - sttm < 30):
+            newCount = getListingCount(driver)
+        count = getListingCount(driver)
+        subClusters = getClusters(driver)
+
+    mainClusterDict[i].update(
+        {'subClustersOver350': subClustersOver350,
+            'numSubClustersOver350': len(subClustersOver350)})
+    uniqueUrls = list(set(allUrls))
+    return subClustersUnder350, \
+        subClustersOver350, \
+        totalCountFromSubClusters, \
+        uniqueUrls
+
+
+def getMainClusters(driver, mainClusterDict):
+    uniqueUrls = []
     origUrl = driver.current_url
-    mainClusterDict = {}
     totalCountFromClusters = 0
-    clusters = driver.find_elements(
-        By.XPATH, '//div[@class="clusterMarkersContainer"]/div')
+    clusters = getClusters(driver)
     numClusters = len(clusters)
     count = getListingCount(driver)
     origCount = count
     mainClustersUnder350 = []
     mainClustersOver350 = []
 
-    for i in range(len(clusters)):
+    for i in range(numClusters):
+        if (i in mainClusterDict.keys()) and (mainClusterDict[i]['complete']):
+            continue
+        else:
+            if i not in mainClusterDict.keys():
+                mainClusterDict[i] = {'complete': False, 'subClusters': {}}
         assert len(clusters) == numClusters
         assert origCount - 3 <= count <= origCount + 3
         print('Clicking {0} of {1} main clusters'.format(
             i + 1, len(clusters)))
         try:
             clusters[i].click()
-            mainClusterDict[i] = {'clickable': 'yes'}
+            mainClusterDict[i].update({'clickable': 'yes'})
+            print('We clicked it!')
+            ensurePageReady(driver)
         except:
-            mainClusterDict[i] = {'clickable': 'no'}
+            print('Could not click it.')
+            mainClusterDict[i].update({'clickable': 'no'})
             continue
         newCount = getListingCount(driver)
         sttm = time.time()
@@ -91,27 +294,46 @@ def getMainClusters(driver):
         count = getListingCount(driver)
         mainClusterDict[i].update({'count': count, 'url': driver.current_url})
         totalCountFromClusters += count
-        if count > 350:
+        if count > 345:
+            print('Main cluster {0} has more than 350 listings'.format(i + 1))
+            print('Traversing subclusters')
+            subClustersUnder350, subClustersOver350, \
+                totalCountFromSubClusters, \
+                uniqueSubClusterUrls = getSubClusters(
+                    driver, mainClusterDict, i)
+            uniqueUrls += uniqueSubClusterUrls
+            pctObtained = len(uniqueSubClusterUrls) / count
+            mainClusterDict[i].update(
+                {'pctObtained': pctObtained,
+                    'listingUrls': uniqueSubClusterUrls})
             mainClustersOver350.append(i)
-            driver.back()
+            driver.get(origUrl)
+            ensurePageReady(driver)
         else:
+            print('Main cluster {0} has less than 350 listings'.format(i + 1))
+            print('Getting the individual listing urls.')
             listingUrls = getAllUrls(driver)
             assert count - 2 <= len(listingUrls) <= count + 2
-            mainClusterDict[i].update({'listingUrls': listingUrls})
+            pctObtained = len(listingUrls) / count
+            mainClusterDict[i].update(
+                {'subClusterDict': None,
+                    'pctObtained': pctObtained,
+                    'listingUrls': listingUrls})
             mainClustersUnder350.append(i)
             driver.get(origUrl)
+            ensurePageReady(driver)
+        mainClusterDict[i]['complete'] = True
         newCount = getListingCount(driver)
         sttm = time.time()
         while (newCount == count) and (time.time() - sttm < 30):
             newCount = getListingCount(driver)
         count = getListingCount(driver)
-        clusters = driver.find_elements(
-            By.XPATH, '//div[@class="clusterMarkersContainer"]/div')
+        clusters = getClusters(driver)
 
-    return mainClusterDict, \
-        mainClustersUnder350, \
+    return mainClustersUnder350, \
         mainClustersOver350, \
-        totalCountFromClusters
+        totalCountFromClusters, \
+        uniqueUrls
 
 
 def getPageUrls(driver):
@@ -123,44 +345,45 @@ def getPageUrls(driver):
             url = pageLink.get_attribute('href')
             zcUrls.append(url)
     except:
-        print("no page links for")
+        print("No page links for")
 
     return zcUrls
 
 
 def getAllUrls(driver):
 
-    allZipCodeUrls = []
+    allUrls = []
 
     firstUrls = getPageUrls(driver)
     if len(firstUrls) == 0:
-        print("no listings for " + zc)
-        return allZipCodeUrls
+        print("No listings for " + zc)
+        return allUrls
         # noListings.append(zc)
 
-    allZipCodeUrls += firstUrls
-    print('first page got {0} urls'.format(len(firstUrls)))
+    allUrls += firstUrls
+    print('First page got {0} urls'.format(len(firstUrls)))
     nextPages = driver.find_elements(
         By.XPATH, '''//*[@id="sidepane-root"]/div[2]/''' +
         '''div/div[4]/div[2]/a[contains(@class,"goToPage")]''')
     if len(nextPages) == 0:
-        return allZipCodeUrls
+        return allUrls
 
     actions = ActionChains(driver)
-    print('trying {0} more pages'.format(len(nextPages) - 1))
+    print('Scraping {0} more pages'.format(len(nextPages) - 1))
 
-    for i in range(1, len(nextPages)):
+    for k in range(1, len(nextPages)):
         thisPage = driver.find_element(
             By.XPATH,
-            '//a[@data-rf-test-id="react-data-paginate-page-{0}"]'.format(i))
-        actions.move_to_element(thisPage)
-        actions.click(thisPage)
+            '//a[@data-rf-test-id="react-data-paginate-page-{0}"]'.format(k))
+        actions.move_to_element(thisPage).perform()
+        thisPage.click()
+        checkForLoginPrompt(driver)
         time.sleep(2)
         nextUrls = getPageUrls(driver)
-        print('page {0} got {1} urls'.format(i+1, len(nextUrls)))
-        allZipCodeUrls += nextUrls
+        print('Page {0} got {1} urls'.format(k + 1, len(nextUrls)))
+        allUrls += nextUrls
 
-    return allZipCodeUrls
+    return allUrls
 
 
 def traverse(driver):
@@ -308,6 +531,10 @@ def getEventsFromListing(driver):
     return events
 
 
+def pickleClusterDict(clusterDict):
+    pickle.dump(clusterDict, open('main_cluster_dict.pkl','wb'))
+
+
 def writeCsv(outfile, row):
 
     with open(outfile, 'wb') as f:
@@ -351,17 +578,15 @@ def writeCsv(outfile, row):
 newNotListed = []
 noListings = []
 
-
-for zc in ['94609']:
-# for zc in zips:
-    listingUrls = []
+for zc in zips:
     fname = OUT_DIR + 'sales_' + zc + '_' + startDate + '.csv'
     print("getting driver for " + zc)
     if zc in not_listed:
         continue
 
     allZipCodeUrls = []
-    driver = getChromeDriver(zc, chromeOptions=chrome_options)
+    driver = goToRedfin(zc, chrome_options)
+
     print("got driver for " + zc)
 
     if driver.current_url == 'https://www.redfin.com/out-of-area-signup':
@@ -370,119 +595,29 @@ for zc in ['94609']:
         continue
 
     totalListings = getListingCount(driver)
+    # mainClusterDict = {}
+    mainClusterDict = pickle.load(open('main_cluster_dict.pkl', 'rb'))
     if totalListings < 345:
-        listingUrls += getAllUrls(driver)
+        allZipCodeUrls = getAllUrls(driver)
     else:
-        origUrl = driver.current_url
-        mainClusterDict = {}
-        totalCountFromClusters = 0
-        clusters = driver.find_elements(
-            By.XPATH, '//div[@class="clusterMarkersContainer"]/div')
-        numClusters = len(clusters)
-        count = getListingCount(driver)
-        origCount = count
-        mainClustersUnder350 = []
-        mainClustersOver350 = []
+        mainClustersUnder350, mainClustersOver350, \
+            totalCountFromClusters, allZipCodeUrls = getMainClusters(
+                driver, mainClusterDict)
+        numMainClusters = len(mainClusterDict.items())
+        numClickableClusters = sum(
+            1 for cluster in mainClusterDict.values()
+            if cluster['clickable'] == 'yes')
+        pctScrapable = round(totalCountFromClusters / totalListings, 3) * 100
+        print('{0} of {1} main clusters are clickable'.format(
+            numClickableClusters, numMainClusters))
+        print('{0} of {1} total listings ({2}%) '.format(
+            totalCountFromClusters, totalListings, pctScrapable) +
+            'are scrapable from main clusters')
+    totalUrlsObtained = len(allZipCodeUrls)
+    pctUrlsObtained = totalUrlsObtained / totalListings
+    print('{0} of {1} total listings urls ({2}%) were obtained'.format(
+        len(allZipCodeUrls), totalListings, pctUrlsObtained))
 
-        for i in range(len(clusters)):
-            assert len(clusters) == numClusters
-            assert origCount - 3 <= count <= origCount + 3
-            print('Clicking {0} of {1} main clusters'.format(
-                i + 1, len(clusters)))
-            try:
-                clusters[i].click()
-                mainClusterDict[i] = {'clickable': 'yes'}
-            except:
-                mainClusterDict[i] = {'clickable': 'no'}
-                continue
-            newCount = getListingCount(driver)
-            sttm = time.time()
-            while (newCount == count) and (time.time() - sttm < 30):
-                newCount = getListingCount(driver)
-            count = getListingCount(driver)
-            mainClusterDict[i].update({'count': count, 'url': driver.current_url})
-            totalCountFromClusters += count
-            if count > 350:
-                mainClustersOver350.append(i)
-                driver.back()
-            else:
-                listingUrls = getAllUrls(driver)
-                assert count - 2 <= len(listingUrls) <= count + 2
-                mainClusterDict[i].update({'listingUrls': listingUrls})
-                mainClustersUnder350.append(i)
-                driver.get(origUrl)
-            newCount = getListingCount(driver)
-            sttm = time.time()
-            while (newCount == count) and (time.time() - sttm < 30):
-                newCount = getListingCount(driver)
-            count = getListingCount(driver)
-            clusters = driver.find_elements(
-                By.XPATH, '//div[@class="clusterMarkersContainer"]/div')
-        # mainClusterDict, mainClustersUnder350, mainClustersOver350, \
-        #     totalCountFromClusters = getMainClusters(driver)
-        # numMainClusters = len(mainClusterDict.items())
-        # numClickableClusters = sum(
-        #     1 for cluster in mainClusterDict.values()
-        #     if cluster['clickable'] == 'yes')
-        # pctListings = round(totalCountFromClusters / totalListings, 3) * 100
-        # print('{0} of {1} main clusters are clickable'.format(
-        #     numClickableClusters, numMainClusters))
-        # print('{0} of {1} total listings ({2}%) ' +
-        #       'are scrapable from main clusters'.format(
-        #           totalCountFromClusters, totalListings, pctListings))
-
-    break
-
-    for j, url in enumerate(clusterUrlsOver350):
-        print('{0} of {1} oversized clusters'.format(j+1,len(clusterUrlsOver350)))
-        if url[-4:] == '#fsd':
-            url = url[:-4]
-        driver.get(url)
-        newCount = getListingCount(driver)
-        while newCount == count:
-            newCount = getListingCount(driver)
-        subClusters = driver.find_elements(By.XPATH, '//div[@class="clusterMarkersContainer"]/div')    
-        print('{0} in oversized cluster {1} with {2} subclusters'.format(newCount, j+1, len(subClusters)))
-        for i in range(len(subClusters)):
-            print('{0} of {1} subclusters'.format(i+1, len(subClusters)))
-            try:
-                subClusters[i].click()
-            except:
-                print('click dont work')
-                continue
-            sttm = time.time()
-            subCount = getListingCount(driver)
-            while (subCount == newCount) and (time.time() - sttm < 30):
-                subCount = getListingCount(driver)
-            if subCount == newCount:
-                print('no dice. returning to main cluster at {0}'.format(time.asctime()))
-                driver.get(url)
-                time.sleep(1)
-                newCount = getListingCount(driver)
-                subClusters = driver.find_elements(By.XPATH, '//div[@class="clusterMarkersContainer"]/div')
-                print('back to main cluster with {0} listings and {1} subclusters'.format(newCount, len(subClusters)))
-                continue
-            print('{0} in subcluster {1}'.format(subCount, i+1))
-            driver.current_url
-            if subCount > 350:
-                subClusterUrlsOver350.append(driver.current_url)
-            else:
-                urls += subCount
-                clusterUrlsUnder350.append(driver.current_url)
-            driver.back()
-            sttm = time.time()
-            newCount = getListingCount(driver)
-            while (newCount == subCount) and (time.time() - sttm < 30):
-                newCount = getListingCount(driver)
-            if newCount == subCount:
-                driver.get(url)
-                print('had to reconnect to main cluster at {0}'.format(time.asctime()))
-                time.sleep(1)
-            newCount = getListingCount(driver)
-            subClusters = driver.find_elements(By.XPATH, '//div[@class="clusterMarkersContainer"]/div')
-            print('back to main cluster with {0} listings and {1} subclusters'.format(newCount, len(subClusters)))
-    
-    print urls/totalListings 
     break
 
 
