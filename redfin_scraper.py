@@ -322,7 +322,7 @@ def getSubClustersInParallel(driver, mainClusterDict, mainClusterNo,
     for j in subClustersDict.keys():
         allListingUrls += subClustersDict[j]['listingUrls']
     uniqueUrls = set(allListingUrls)
-    pctObtained = len(uniqueUrls) / count
+    pctObtained = round(len(uniqueUrls) / count, 3) * 100
 
     clusterDict.update(
         {'subClustersOver350': subClustersOver350,
@@ -741,12 +741,13 @@ for zc in zips:
         uniqueUrls = set([url for url in clustersDict[i]['listingUrls']
                           for i in clustersDict.keys()])
     pctObtained = round(len(uniqueUrls) / totalListings, 3) * 100.0
-    print(('{0} of {1} of listings ({2}%) from zipcode '
+    print(('{0} of {1} of unique listings ({2}%) from zipcode '
           '{3} were scraped.').format(
           len(uniqueUrls), totalListings, pctObtained, zc))
-    print(('{0} of {1} main clusters from zipcode '
-          '{2} were not clicked.').format(
-          numClustersNotClicked, numMainClusters, zc))
+    if numClustersNotClicked > 0:
+        print(('{0} of {1} main clusters from zipcode '
+              '{2} were not clicked.').format(
+              numClustersNotClicked, numMainClusters, zc))
 
 
 
