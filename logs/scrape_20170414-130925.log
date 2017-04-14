@@ -1,0 +1,12 @@
+INFO:root:Getting driver for zipcode 44122.
+INFO:root:Got driver for zipcode 44122.
+INFO:root:Found 2688 listings in zipcode 44122.
+INFO:root:Found 11 clusters in zipcode 44122.
+INFO:root:Processing cluster 5 of 11 in zipcode 44122.
+INFO:root:Found 34 subclusters in cluster 5 in zipcode 44122.
+INFO:root:Subcluster 5.2 could not be clicked.
+INFO:root:0 of 411 unique listings (0.0%) in cluster 5 from zipcode 44122 were scraped.
+INFO:root:1 of 34 subclusters in cluster 5 from zipcode 44122 were not clicked.
+INFO:root:Back to main page for zipcode 44122.
+INFO:root:0 of 2688 of unique listings (0.0%) from zipcode 44122 were scraped.
+INFO:root:Took 145.920789003 seconds to process zipcode 44122.

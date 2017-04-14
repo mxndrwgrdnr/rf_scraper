@@ -3,7 +3,7 @@ import csv
 import redfin_scraper
 import time
 
-rf = redfin_scraper.redfinScraper(virtualDisplay=True)
+rf = redfin_scraper.redfinScraper(virtualDisplay=False)
 
 
 

@@ -1,0 +1,7 @@
+INFO:root:Getting driver for zipcode 94609.
+INFO:root:Got driver for zipcode 94609.
+INFO:root:Found 3423 listings in zipcode 94609.
+INFO:root:Found 12 clusters in zipcode 94609.
+INFO:root:Processing cluster 1 of 12 in zipcode 94609.
+INFO:root:Found 25 subclusters in cluster 1 in zipcode 94609.
+INFO:root:Subcluster 1.1 timed out. Had to terminate.

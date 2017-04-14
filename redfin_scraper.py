@@ -24,6 +24,7 @@ chrome_options.add_extension("./proxy.zip")
 chrome_options.add_argument("--ignore-certificate-errors")
 chrome_options.add_argument("--window-size=1024,768")
 chrome_options.add_argument("--start-maximized")
+chrome_options.add_argument("--disable-infobars")
 sttm = dt.now().strftime('%Y%m%d-%H%M%S')
 dataDir = './data/'
 
@@ -118,7 +119,7 @@ class redfinScraper(object):
             mapFound = self.checkForMap(driver, zipOrClusterId)
             return mapFound
         try:
-            WebDriverWait(driver, 30).until(
+            WebDriverWait(driver, 60).until(
                 EC.invisibility_of_element_located(
                     (By.XPATH,
                         '//div[@data-rf-test-name="progress-bar-text"]')))
@@ -194,19 +195,21 @@ class redfinScraper(object):
         return driver
 
 
-    def goToRedfinViewport(self, url):
+    def goToRedfinViewport(self, url, zipOrClusterId=False):
         if not zipOrClusterId:
             zipOrClusterId = url
         driver = self.getChromeDriver()
         try:
             driver.get(url)
         except:
+            logging.info('Could not navigate to url for {0}: {1}'.format(zipOrClusterId, url))
             driver.quit()
             return False
         self.switchToTableView(driver)
-        if self.ensureMapClickable(driver):
+        if self.ensureMapClickable(driver, zipOrClusterId):
             return driver
         else:
+            logging.info('Map was not clickable at {0}: {1}'.format(zipOrClusterId, url))
             driver.quit()
             return False
 
@@ -286,7 +289,7 @@ class redfinScraper(object):
         count = 0
         listingUrls = []
         try:
-            scDriver = self.goToRedfinViewport(mainClusterUrl)
+            scDriver = self.goToRedfinViewport(mainClusterUrl, 'main cluster {0} for subcluster {1}'.format(i + 1, j + 1))
             if not scDriver:
                 raise Exception
         except:
@@ -331,7 +334,7 @@ class redfinScraper(object):
 
 
     def getSubClustersInParallel(self, driver, mainClusterDict, mainClusterNo,
-                                 zipcode, timeout=30):
+                                 zipcode, timeout=120):
         i = mainClusterNo
         mainClusterUrl = driver.current_url
         subClusters = self.getClusters(driver)
@@ -369,7 +372,7 @@ class redfinScraper(object):
 
         clusterDict['subClusters'] = dict(parallelDict)
         for j in timeouts:
-            clusterDict['subClusters'][j]['clickable'] = False
+            clusterDict['subClusters'][j] = self.formatSubClusterDict(False, None, False, None, None)
         subClustersDict = clusterDict['subClusters']
         subClustersOver350 = [j for j in subClustersDict.keys()
                               if subClustersDict[j]['count'] > 345]
@@ -377,6 +380,10 @@ class redfinScraper(object):
         subClustersNotClicked = [j for j in subClustersDict.keys()
                                  if not subClustersDict[j]['clickable']]
         numSubClustersNotClicked = len(subClustersNotClicked)
+
+        if not subClustersDict.keys():
+            logging.info('No subcluster dictionary for main cluster {0}!'.format(i + 1))
+            return
         for j in subClustersDict.keys():
             allListingUrls += subClustersDict[j]['listingUrls']
         uniqueUrls = set(allListingUrls)
@@ -402,7 +409,7 @@ class redfinScraper(object):
         count = self.getListingCount(driver)
 
         logging.info('Found {0} clusters in zipcode {1}.'.format(numClusters, zc))
-        for i in range(numClusters):
+        for i in [4]: #range(numClusters):
             clusterID = i + 1
             sttm = time.time()
             logging.info('Processing cluster {0} of {1} in zipcode {2}.'.format(
@@ -540,10 +547,10 @@ class redfinScraper(object):
                 uniqueUrls = set(allZipCodeUrls)
             totalTime = time.time() - sttm
             pctObtained = round(len(uniqueUrls) / totalListings, 3) * 100.0
-            print(('{0} of {1} of unique listings ({2}%) from zipcode '
+            logging.info(('{0} of {1} of unique listings ({2}%) from zipcode '
                   '{3} were scraped.').format(
                   len(uniqueUrls), totalListings, pctObtained, zc))
-            print('Took {0} seconds to process zipcode {1}.'.format(totalTime, zc))
+            logging.info('Took {0} seconds to process zipcode {1}.'.format(totalTime, zc))
             if numClustersNotClicked > 0:
                 print(('{0} of {1} main clusters from zipcode '
                       '{2} were not clicked.').format(
