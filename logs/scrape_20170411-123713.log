@@ -73,3 +73,4 @@ INFO:root:Subcluster 5.29 Chrome instance failed to load.
 INFO:root:0 of 466 unique listings (0.0%) in cluster 5 from zipcode 44122 were scraped.
 INFO:root:29 of 29 subclusters in cluster 5 from zipcode 44122 were not clicked.
 INFO:root:Back to main page for zipcode 44122.
+INFO:root:Processing cluster 6 of 12 in zipcode 44122.

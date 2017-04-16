@@ -1,12 +1,7 @@
-import logging
 import csv
 import redfin_scraper
-import time
 
-rf = redfin_scraper.redfinScraper(virtualDisplay=False)
-
-
-
+rf = redfin_scraper.redfinScraper(virtualDisplay=True)
 
 # zcdb = ZipCodeDatabase()
 # zips = [zc.zip for zc in zcdb.find_zip()]
@@ -18,6 +13,3 @@ with open('not_listed.csv', 'rb') as f:
     not_listed = [zc for zclist in reader for zc in zclist]
 
 mainClusterDict, newNotListed = rf.getUrlsByZipCode(zips, not_listed)
-
-
-    
