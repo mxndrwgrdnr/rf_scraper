@@ -43,16 +43,23 @@ class redfinScraper(object):
         logging.basicConfig(filename=log_fname, level=logging.INFO)
 
     def getChromeDriver(self):
-        driver = webdriver.Chrome(chrome_options=self.chromeOptions)
+        try:
+            driver = webdriver.Chrome(chrome_options=self.chromeOptions)
+        except WebDriverException:
+            return False
         return driver
 
     def switchToTableView(self, driver):
         try:
             button = driver.find_element(
                 By.XPATH, '''//span[@data-rf-test-name="tableOption"]''')
+        except NoSuchElementException:
+            return
+        try:
             button.click()
             return
-        except NoSuchElementException:
+        except WebDriverException:
+            logging.info('Could not switch to redfin table view.')
             return
 
     def checkForLoginPrompt(self, driver, zipOrClusterId=False):
@@ -185,18 +192,17 @@ class redfinScraper(object):
             actions.click(element)
             actions.perform()
         except WebDriverException:
-            logging.info('Cluster {0} could not be clicked on first try.'.
+            logging.info('(sub)cluster {0} could not be clicked on first try.'.
                          format(clusterId))
         self.ensurePageScrapable(driver, clusterId)
+        sttm = time.time()
+        while (driver.current_url == origUrl) and (time.time() - sttm < 15):
+            time.sleep(1)
+
+    def clickIfClickable(self, driver, origUrl, element, clusterId):
+        self.acMoveAndClick(driver, origUrl, element, clusterId)
         if driver.current_url == origUrl:
-            actions.move_to_element(element)
-            try:
-                actions.click(element)
-                actions.perform()
-            except WebDriverException:
-                logging.info('Cluster {0} could not be clicked on first try.'.
-                             format(clusterId))
-            self.ensurePageScrapable(driver, clusterId)
+            self.acMoveAndClick(driver, origUrl, element, clusterId)
         if driver.current_url == origUrl:
             return False
         else:
@@ -216,6 +222,8 @@ class redfinScraper(object):
         if not zipOrClusterId:
             zipOrClusterId = url
         driver = self.getChromeDriver()
+        if not driver:
+            return False
         driver.get(url)
         self.switchToTableView(driver)
         if self.ensureMapClickable(driver, zipOrClusterId):
@@ -307,7 +315,7 @@ class redfinScraper(object):
         subClusters = self.getClusters(scDriver)
         assert len(subClusters) == numSubClusters
         assert scDriver.current_url == mainClusterUrl
-        clickable = self.acMoveAndClick(
+        clickable = self.clickIfClickable(
             scDriver, mainClusterUrl, subClusters[j], subClusterID)
         if clickable is False:
             logging.info(
@@ -329,7 +337,7 @@ class redfinScraper(object):
             listingUrls = self.getAllUrls(scDriver)
             pctObtained = round(len(listingUrls) / count, 2) * 100
             logging.info(
-                'Subcluster {3} returned {0} of {1} ({2}%)'.
+                'Subcluster {3} returned {0} of {1} ({2}%) '.
                 format(len(listingUrls), count, pctObtained, subClusterID) +
                 'listing urls.')
         complete = True
@@ -389,13 +397,13 @@ class redfinScraper(object):
         subClustersNotClicked = [j for j in subClustersDict.keys()
                                  if not subClustersDict[j]['clickable']]
         numSubClustersNotClicked = len(subClustersNotClicked)
-
-        if not subClustersDict.keys():
-            logging.info(
-                'No subcluster dictionary for main cluster {0}!'.format(i + 1))
-            return
         for j in subClustersDict.keys():
-            allListingUrls += subClustersDict[j]['listingUrls']
+            if subClustersDict[j]['listingUrls'] is None:
+                logging.info(
+                    'Subcluster {0}.{1} returned no listing urls'.format(
+                        i + 1, j + 1))
+            else:
+                allListingUrls += subClustersDict[j]['listingUrls']
         uniqueUrls = set(allListingUrls)
         pctObtained = round(len(uniqueUrls) / count, 3) * 100
 
@@ -419,7 +427,7 @@ class redfinScraper(object):
 
         logging.info(
             'Found {0} clusters in zipcode {1}.'.format(numClusters, zc))
-        for i in [4]:  # range(numClusters):
+        for i in [3]:  # range(numClusters):
             clusterID = i + 1
             logging.info(
                 'Processing cluster {0} of {1} in zipcode {2}.'.format(
@@ -438,7 +446,7 @@ class redfinScraper(object):
                         self.instantiateClusterDict()
             assert len(clusters) == numClusters
             assert driver.current_url == origUrl
-            clickable = self.acMoveAndClick(
+            clickable = self.clickIfClickable(
                 driver, origUrl, clusters[i], clusterID)
             mainClusterDict['clusters'][i].update({'clickable': clickable})
             if clickable is False:
@@ -518,7 +526,10 @@ class redfinScraper(object):
                 '//a[@data-rf-test-id="react-data-paginate-page-{0}"]'.format(
                     k))
             actions.move_to_element(nextPage).perform()
-            nextPage.click()
+            try:
+                nextPage.click()
+            except WebDriverException:
+                continue
             time.sleep(2)
             nextUrls = self.getPageUrls(driver)
             allUrls += nextUrls
