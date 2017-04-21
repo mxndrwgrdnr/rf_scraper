@@ -10,12 +10,12 @@ from selenium.common.exceptions \
 from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.chrome.options import Options
 from itertools import izip_longest
-from datetime import datetime as dt
+from datetime import datetime as dt, timedelta as td
 import logging
 import time
 import pickle
 from multiprocessing import Process, Manager
-
+import psycopg2
 
 chrome_options = Options()
 chrome_options.add_extension("./proxy.zip")
@@ -29,25 +29,31 @@ dataDir = './data/'
 
 class redfinScraper(object):
 
-    def __init__(self, virtualDisplay=False, chromeOptions=chrome_options,
+    def __init__(self, virtualDisplay=False, subClusterMode='parallel',
+                 timeFilter='sold-all', chromeOptions=chrome_options,
                  startTime=sttm, dataDir=dataDir):
 
         self.chromeOptions = chromeOptions
         self.startTime = startTime
         self.dataDir = dataDir
+        self.timeFilter = timeFilter
+        self.subClusterMode = subClusterMode
+        # self.driver = None
         if virtualDisplay:
             display = Display(visible=0, size=(1024, 768))
             display.start()
         log_fname = './logs/scrape_' + self.startTime + '.log'
         print('Writing log to {0}'.format(log_fname))
         logging.basicConfig(filename=log_fname, level=logging.INFO)
+        self.notListedFName = './not_listed.csv'
+        self.zipsReqSignInFName = './zips_req_signin.csv'
 
     def getChromeDriver(self):
         try:
             driver = webdriver.Chrome(chrome_options=self.chromeOptions)
-        except WebDriverException:
-            return False
-        return driver
+        except WebDriverException as e:
+            return False, str(e)
+        return driver, 'ok'
 
     def switchToTableView(self, driver):
         try:
@@ -97,20 +103,16 @@ class redfinScraper(object):
                     By.XPATH, '//div[@class="GoogleMapView"]')
                 noMap = False
             except NoSuchElementException:
-                logging.info(
-                    'No map detected at {0}. Refreshing browser. Try #{1}'.
-                    format(zipOrClusterId, tries))
                 driver.refresh()
                 tries += 1
                 time.sleep(5)
         if noMap:
-            logging.info('Could not load map at {0}'.format(zipOrClusterId))
-            return False
+            msg = 'Could not load map at {0}'.format(zipOrClusterId)
+            return False, msg
         else:
-            if tries > 1:
-                logging.info(
-                    'Found map after all at {0}.'.format(zipOrClusterId))
-            return True
+            msg = 'Found map for {0} after {1} tries.'.format(
+                zipOrClusterId, tries)
+            return True, msg
 
     def waitForProgressBar(self, driver, zipOrClusterId=False):
         if not zipOrClusterId:
@@ -121,20 +123,19 @@ class redfinScraper(object):
                     (By.XPATH,
                         '//div[@data-rf-test-name="progress-bar-text"]')))
         except TimeoutException:
-            mapFound = self.checkForMap(driver, zipOrClusterId)
-            return mapFound
+            mapFound, msg = self.checkForMap(driver, zipOrClusterId)
+            return mapFound, msg
         try:
             WebDriverWait(driver, 60).until(
                 EC.invisibility_of_element_located(
                     (By.XPATH,
                         '//div[@data-rf-test-name="progress-bar-text"]')))
         except TimeoutException:
-            logging.info(
-                'Timed out waiting for progress bar to finish' +
-                ' at {0}. Refreshing browser.'.format(zipOrClusterId))
+            msg = 'Timed out waiting for progress bar to finish' + \
+                ' at {0}. Refreshing browser.'.format(zipOrClusterId)
             driver.refresh()
-            return False
-        return True
+            return False, msg
+        return True, 'ok'
 
     def checkForFlyout(self, driver, zipOrClusterId=False):
         if not zipOrClusterId:
@@ -155,7 +156,7 @@ class redfinScraper(object):
                 driver.find_element(
                     By.XPATH, '//div[@class="clickableHome MultiUnitFlyout"]')
                 logging.info(
-                    'Flyout menu detected at {0}.' +
+                    'Flyout menu detected at {0}.'
                     ' Clicking next row to close flyout.'.format(
                         zipOrClusterId))
                 nextRow = driver.find_element(
@@ -174,16 +175,16 @@ class redfinScraper(object):
         return
 
     def ensureMapClickable(self, driver, zipOrClusterId=False):
-        ok = self.ensurePageScrapable(driver, zipOrClusterId)
+        ok, msg = self.ensurePageScrapable(driver, zipOrClusterId)
         self.checkForPopUp(driver)
         self.checkForFlyout(driver, zipOrClusterId)
-        return ok
+        return ok, msg
 
     def ensurePageScrapable(self, driver, zipOrClusterId=False):
         self.checkForLoginPrompt(driver, zipOrClusterId)
-        ok = self.waitForProgressBar(driver, zipOrClusterId)
+        ok, msg = self.waitForProgressBar(driver, zipOrClusterId)
         self.switchToTableView(driver)
-        return ok
+        return ok, msg
 
     def acMoveAndClick(self, driver, origUrl, element, clusterId):
         actions = ActionChains(driver)
@@ -209,31 +210,31 @@ class redfinScraper(object):
             return True
 
     def goToRedfin(self, zipcode):
-        driver = self.getChromeDriver()
+        driver, msg = self.getChromeDriver()
         zc = zipcode
         url = "http://www.redfin.com/zipcode/" + zc + \
-            "/filter/include=sold-all"
+            "/filter/include=" + self.timeFilter
         driver.get(url)
         self.switchToTableView(driver)
-        self.ensureMapClickable(driver)
-        return driver
+        mapClickable, msg = self.ensureMapClickable(driver)
+        if not mapClickable:
+            return False, msg
+        return driver, 'ok'
 
     def goToRedfinViewport(self, url, zipOrClusterId=False):
         if not zipOrClusterId:
             zipOrClusterId = url
-        driver = self.getChromeDriver()
+        driver, msg = self.getChromeDriver()
         if not driver:
-            return False
+            return False, msg
         driver.get(url)
         self.switchToTableView(driver)
-        if self.ensureMapClickable(driver, zipOrClusterId):
-            return driver
-        else:
-            logging.info(
-                'Map was not clickable at {0}: {1}'.format(
-                    zipOrClusterId, url))
+        mapClickable, msg = self.ensureMapClickable(driver, zipOrClusterId)
+        if not mapClickable:
             driver.quit()
-            return False
+            return False, msg
+        else:
+            return driver, 'ok'
 
     def waitForListingsToLoad(self, driver, count):
         newCount = self.getListingCount(driver)
@@ -292,7 +293,7 @@ class redfinScraper(object):
                        'listingUrls': listingUrls}
         return clusterDict
 
-    def scrapeSubClusterUrls(self, parallelDict, mainClusterUrl, mainClusterNo,
+    def scrapeSubClusterUrls(self, IODict, mainClusterUrl, mainClusterNo,
                              numSubClusters, subClusterNo, mainClusterCount):
         i = mainClusterNo
         j = subClusterNo
@@ -302,14 +303,14 @@ class redfinScraper(object):
         clickable = None
         count = 0
         listingUrls = []
-        scDriver = self.goToRedfinViewport(
+        scDriver, msg = self.goToRedfinViewport(
             mainClusterUrl, 'main cluster {0} for subcluster {1}'.format(
                 i + 1, j + 1))
         if not scDriver:
             logging.info(
-                'Subcluster {0} Chrome instance failed to load.'.format(
-                    subClusterID))
-            parallelDict[j] = self.formatSubClusterDict(
+                'Subcluster {0} Chrome instance failed to load. {1}'.format(
+                    subClusterID, msg))
+            IODict[j] = self.formatSubClusterDict(
                 complete, url, clickable, count, listingUrls)
             return
         subClusters = self.getClusters(scDriver)
@@ -323,7 +324,7 @@ class redfinScraper(object):
                     subClusterID))
             complete = True
             scDriver.quit()
-            parallelDict[j] = self.formatSubClusterDict(
+            IODict[j] = self.formatSubClusterDict(
                 complete, url, clickable, count, listingUrls)
             return
         self.waitForListingsToLoad(scDriver, mainClusterCount)
@@ -337,17 +338,17 @@ class redfinScraper(object):
             listingUrls = self.getAllUrls(scDriver)
             pctObtained = round(len(listingUrls) / count, 2) * 100
             logging.info(
-                'Subcluster {3} returned {0} of {1} ({2}%) '.
-                format(len(listingUrls), count, pctObtained, subClusterID) +
-                'listing urls.')
+                'Subcluster {3} returned {0} of {1} ({2}%) listing urls.'.
+                format(len(listingUrls), count, pctObtained, subClusterID))
         complete = True
-        parallelDict[j] = self.formatSubClusterDict(
+        IODict[j] = self.formatSubClusterDict(
             complete, url, clickable, count, listingUrls)
         scDriver.quit()
         return
 
-    def getSubClustersInParallel(self, driver, mainClusterDict, mainClusterNo,
-                                 zipcode, timeout=120):
+    def getSubClusters(self, driver, mainClusterDict, mainClusterNo,
+                       zipcode, timeout=120):
+        mode = self.subClusterMode
         i = mainClusterNo
         mainClusterUrl = driver.current_url
         subClusters = self.getClusters(driver)
@@ -359,37 +360,46 @@ class redfinScraper(object):
         clusterDict['numSubClusters'] = numSubClusters
         count = clusterDict['count']
         allListingUrls = []
-        manager = Manager()
-        parallelDict = manager.dict()
-        jobs = []
-        timeouts = []
 
+        if mode == 'parallel':
+            manager = Manager()
+            parallelDict = manager.dict()
+            jobs = []
+            timeouts = []
+        else:
+            seriesDict = dict()
         for j in range(len(subClusters)):
             if ('subClusters' in clusterDict.keys()) and \
                (j in clusterDict['subClusters'].keys()) and \
                (clusterDict['subClusters'][j]['complete']):
                 continue
             else:
-                proc = Process(
-                    target=self.scrapeSubClusterUrls,
-                    args=(parallelDict, mainClusterUrl, i,
-                          numSubClusters, j, count))
-                proc.start()
-                jobs.append(proc)
-
-        for j, job in enumerate(jobs):
-            job.join(timeout)
-            if job.is_alive():
-                job.terminate()
-                timeouts.append(j)
-                logging.info(
-                    'Subcluster {0}.{1} timed out. Had to terminate.'.format(
-                        i + 1, j + 1))
-
-        clusterDict['subClusters'] = dict(parallelDict)
-        for j in timeouts:
-            clusterDict['subClusters'][j] = self.formatSubClusterDict(
-                False, None, False, None, None)
+                if mode == 'parallel':
+                    proc = Process(
+                        target=self.scrapeSubClusterUrls,
+                        args=(parallelDict, mainClusterUrl, i,
+                              numSubClusters, j, count))
+                    proc.start()
+                    jobs.append(proc)
+                else:
+                    self.scrapeSubClusterUrls(
+                        seriesDict, mainClusterUrl, i,
+                        numSubClusters, j, count)
+        if mode == 'parallel':
+            for j, job in enumerate(jobs):
+                job.join(timeout)
+                if job.is_alive():
+                    job.terminate()
+                    timeouts.append(j)
+                    logging.info(
+                        'Subcluster {0}.{1} timed out. Had to terminate.'.
+                        format(i + 1, j + 1))
+            clusterDict['subClusters'] = dict(parallelDict)
+            for j in timeouts:
+                clusterDict['subClusters'][j] = self.formatSubClusterDict(
+                    False, None, False, None, [])
+        else:
+            clusterDict = seriesDict
         subClustersDict = clusterDict['subClusters']
         subClustersOver350 = [j for j in subClustersDict.keys()
                               if subClustersDict[j]['count'] > 345]
@@ -398,15 +408,9 @@ class redfinScraper(object):
                                  if not subClustersDict[j]['clickable']]
         numSubClustersNotClicked = len(subClustersNotClicked)
         for j in subClustersDict.keys():
-            if subClustersDict[j]['listingUrls'] is None:
-                logging.info(
-                    'Subcluster {0}.{1} returned no listing urls'.format(
-                        i + 1, j + 1))
-            else:
-                allListingUrls += subClustersDict[j]['listingUrls']
+            allListingUrls += subClustersDict[j]['listingUrls']
         uniqueUrls = set(allListingUrls)
         pctObtained = round(len(uniqueUrls) / count, 3) * 100
-
         clusterDict.update(
             {'subClustersOver350': subClustersOver350,
                 'numSubClustersOver350': numSubClustersOver350,
@@ -414,7 +418,6 @@ class redfinScraper(object):
                 'numSubClustersNotClicked': numSubClustersNotClicked,
                 'pctObtained': pctObtained,
                 'listingUrls': uniqueUrls})
-
         return
 
     def getMainClusters(self, driver, mainClusterDict, zipcode):
@@ -427,33 +430,40 @@ class redfinScraper(object):
 
         logging.info(
             'Found {0} clusters in zipcode {1}.'.format(numClusters, zc))
-        for i in [3]:  # range(numClusters):
+        for i in range(numClusters):
             clusterID = i + 1
+            logging.info('*' * 90)
             logging.info(
-                'Processing cluster {0} of {1} in zipcode {2}.'.format(
-                    i + 1, numClusters, zc))
+                'Processing cluster {0} of {1}'
+                ' in zipcode {2}.'.format(
+                    i + 1, numClusters, zc).center(80, ' ').center(90, '*'))
             if (i in mainClusterDict['clusters'].keys()) and \
                (mainClusterDict['clusters'][i]['complete']):
                 logging.info(
-                    'Cluster {0} of {1} already processed with {2}% '.format(
+                    'Cluster {0} of {1} already processed with {2}% '
+                    'of unique listings obtained.'.format(
                         i + 1, numClusters,
-                        mainClusterDict['clusters'][i]['pctObtained']) +
-                    'of unique listings obtained.')
+                        mainClusterDict['clusters'][i]['pctObtained']).
+                    center(80, ' ').center(90, '*'))
+                logging.info('*' * 90)
                 continue
             else:
                 if i not in mainClusterDict['clusters'].keys():
                     mainClusterDict['clusters'][i] = \
                         self.instantiateClusterDict()
+            logging.info('*' * 90)
             assert len(clusters) == numClusters
             assert driver.current_url == origUrl
             clickable = self.clickIfClickable(
                 driver, origUrl, clusters[i], clusterID)
             mainClusterDict['clusters'][i].update({'clickable': clickable})
             if clickable is False:
+                logging.info('*' * 90)
                 logging.info(
-                    'Main cluster {0} from zipcode {1} ' +
-                    'could not be clicked.'.format(
-                        i + 1, zc))
+                    'Main cluster {0} from zipcode {1}'
+                    ' could not be clicked.'.
+                    format(i + 1, zc).center(80, ' ').center(90, '*'))
+                logging.info('*' * 90)
                 continue
             self.waitForListingsToLoad(driver, count)
             count = self.getListingCount(driver)
@@ -461,7 +471,7 @@ class redfinScraper(object):
                 update({'count': count, 'url': driver.current_url})
             if count > 345:
                 self.checkForClusters(driver)
-                self.getSubClustersInParallel(
+                self.getSubClusters(
                     driver, mainClusterDict, i, zipcode)
             else:
                 listingUrls = self.getAllUrls(driver)
@@ -470,21 +480,28 @@ class redfinScraper(object):
                     {'pctObtained': pctObtained,
                         'listingUrls': listingUrls})
             clusterInfo = mainClusterDict['clusters'][i]
-            logging.info('{0} of {1} unique listings ({2}%) '.format(
-                len(clusterInfo['listingUrls']), count,
-                clusterInfo['pctObtained']) +
-                'in cluster {0} from zipcode {1} were scraped.'.format(
-                    i + 1, zc))
+            logging.info('*' * 90)
+            logging.info(
+                '{0} of {1} unique listings ({2}%) '
+                'in cluster {3} from zipcode {4} were scraped.'.format(
+                    len(clusterInfo['listingUrls']), count,
+                    clusterInfo['pctObtained'], i + 1, zc).center(
+                    80, ' ').center(90, '*'))
             if clusterInfo['numSubClustersOver350'] > 0:
-                logging.info('{0} of {1} subclusters in cluster {2} '.format(
-                    clusterInfo['numSubClustersOver350'],
-                    clusterInfo['numSubClusters'], i + 1) +
-                    'from zipcode {0} had more than 350 listings.'.format(zc))
+                logging.info(
+                    '{0} of {1} subclusters in cluster {2} '
+                    'from zipcode {3} had more than 350 listings.'.format(
+                        clusterInfo['numSubClustersOver350'],
+                        clusterInfo['numSubClusters'], i + 1, zc).center(
+                        80, ' ').center(90, '*'))
             if clusterInfo['numSubClustersNotClicked'] > 0:
-                logging.info('{0} of {1} subclusters in cluster {2} '.format(
-                    clusterInfo['numSubClustersNotClicked'],
-                    clusterInfo['numSubClusters'], i + 1) +
-                    'from zipcode {0} were not clicked.'.format(zc))
+                logging.info(
+                    '{0} of {1} subclusters in cluster {2} '
+                    'from zipcode {3} were not clicked.'.format(
+                        clusterInfo['numSubClustersNotClicked'],
+                        clusterInfo['numSubClusters'], i + 1, zc).center(
+                        80, ' ').center(90, '*'))
+            logging.info('*' * 90)
             logging.info('Back to main page for zipcode {0}.'.format(zc))
             driver.get(origUrl)
             self.ensureMapClickable(driver, clusterID)
@@ -502,8 +519,8 @@ class redfinScraper(object):
             for pageLink in pageLinks:
                 url = pageLink.get_attribute('href')
                 zcUrls.append(url)
-        except Exception, e:
-            print(e)
+        except Exception as e:
+            logging.info(e)
             pass
         return zcUrls
 
@@ -535,59 +552,73 @@ class redfinScraper(object):
             allUrls += nextUrls
         return allUrls
 
-    def getUrlsByZipCode(self, zipcodes, notListed):
-        newNotListed = []
-        for zc in zipcodes:
-            allZipCodeUrls = []
-            logging.info("Getting driver for zipcode {0}.".format(zc))
-            if zc in notListed:
-                continue
-            driver = self.goToRedfin(zc)
-            logging.info("Got driver for zipcode {0}.".format(zc))
-            if driver.current_url == \
-                    'https://www.redfin.com/out-of-area-signup':
-                logging.info('No landing page for zipcode {0}.'.format(zc))
-                newNotListed.append(zc)
-                continue
-            totalListings = self.getListingCount(driver)
+    def getUrlsByZipCode(self, zipcode):
+        zc = zipcode
+        allZipCodeUrls = []
+        logging.info("Getting driver for zipcode {0}.".format(zc))
+        driver, msg = self.goToRedfin(zc)
+        if not driver:
+            logging.info(msg)
+            return False, msg
+        logging.info("Got driver for zipcode {0}.".format(zc))
+        if driver.current_url == \
+                'https://www.redfin.com/out-of-area-signup':
             logging.info(
-                'Found {0} listings in zipcode {1}.'.format(totalListings, zc))
-            sttm = time.time()
-            mainClusterDict = self.instantiateMainClusterDict(zc)
-            if totalListings < 345:
-                uniqueUrls = self.getAllUrls(driver)
-                numMainClusters = 0
-                clustersNotClicked = 0
-            else:
-                self.checkForClusters(driver)
-                self.getMainClusters(driver, mainClusterDict, zc)
-                numMainClusters = mainClusterDict['numClusters']
-                clustersDict = mainClusterDict['clusters']
-                clustersNotClicked = [i for i in clustersDict.keys()
-                                      if not clustersDict[i]['clickable']]
-                numClustersNotClicked = len(clustersNotClicked)
-                for i in clustersDict.keys():
-                    allZipCodeUrls += clustersDict[i]['listingUrls']
-                uniqueUrls = set(allZipCodeUrls)
-            totalTime = time.time() - sttm
-            pctObtained = round(len(uniqueUrls) / totalListings, 3) * 100.0
+                'No landing page for zipcode {0}. Out of area.'.format(zc))
+            with open(self.notListedFName, 'a') as f:
+                writer = csv.writer(f)
+                writer.writerow([zc])
+            return False, 'out of area'
+        totalListings = self.getListingCount(driver)
+        logging.info(
+            'Found {0} listings in zipcode {1}.'.format(totalListings, zc))
+        sttm = time.time()
+        mainClusterDict = self.instantiateMainClusterDict(zc)
+        if totalListings < 345:
+            uniqueUrls = self.getAllUrls(driver)
+            numMainClusters = 0
+            clustersNotClicked = 0
+        else:
+            self.checkForClusters(driver)
+            self.getMainClusters(driver, mainClusterDict, zc)
+            numMainClusters = mainClusterDict['numClusters']
+            clustersDict = mainClusterDict['clusters']
+            clustersNotClicked = [i for i in clustersDict.keys()
+                                  if not clustersDict[i]['clickable']]
+            numClustersNotClicked = len(clustersNotClicked)
+            for i in clustersDict.keys():
+                allZipCodeUrls += clustersDict[i]['listingUrls']
+            uniqueUrls = set(allZipCodeUrls)
+        mainClusterDict['listingUrls'] = list(uniqueUrls)
+        totalTime = round((time.time() - sttm) / 60.0, 1)
+        pctObtained = round(len(uniqueUrls) / totalListings, 3) * 100.0
+        logging.info('#' * 90)
+        logging.info('#' * 90)
+        logging.info(
+            '{0} of {1} of unique listings'
+            ' ({2}%) from zipcode {3} were scraped.'.format(
+                len(uniqueUrls), totalListings, pctObtained,
+                zc).center(80, ' ').center(90, '#').upper())
+        logging.info(
+            'Took {0} min. to process zipcode {1}.'.format(
+                totalTime, zc).center(80, ' ').center(90, '#').upper())
+        if numClustersNotClicked > 0:
             logging.info(
-                '{0} of {1} of unique listings ({2}%) from zipcode '.format(
-                    len(uniqueUrls), totalListings, pctObtained) +
-                '{0} were scraped.'.format(zc))
-            logging.info('Took {0} seconds to process zipcode {1}.'.format(
-                totalTime, zc))
-            if numClustersNotClicked > 0:
-                print('{0} of {1} main clusters from zipcode '.format(
-                    numClustersNotClicked, numMainClusters) +
-                    '{0} were not clicked.'.format(zc))
-        return mainClusterDict, newNotListed
+                '{0} of {1} main clusters from zipcode '
+                '{2} were not clicked.'.format(
+                    numClustersNotClicked, numMainClusters,
+                    zc).center(80, ' ').center(90, '#').upper())
+        logging.info('#' * 90)
+        logging.info('#' * 90)
+        driver.quit()
+        return mainClusterDict, 'ok'
 
     def getEventDate(self, htmlEventElement):
         rawDateStr = htmlEventElement.find_element(
             By.XPATH, './/td[contains(@class,"date-col")]').text
         dateStr = dt.strptime(rawDateStr, '%b %d, %Y').strftime('%Y-%m-%d')
-        return dateStr
+        dateObj = dt.strptime(dateStr, '%Y-%m-%d')
+        return dateStr, dateObj
 
     def getEventPrice(self, htmlEventElement):
         price = htmlEventElement.find_element(
@@ -595,10 +626,14 @@ class redfinScraper(object):
             .text.strip('$').replace(',', '')
         return price.encode('utf-8')
 
-    def getEventsFromListing(self, driver):
+    def getEventsFromListingUrl(self, driver, url):
+        driver.get(url)
         events = []
-        info = driver.find_element(
-            By.XPATH, '//div[contains(@class, "main-stats inline-block")]')
+        try:
+            info = driver.find_element(
+                By.XPATH, '//div[contains(@class, "main-stats inline-block")]')
+        except NoSuchElementException:
+            return None, None
         streetAddr = info.find_element(
             By.XPATH, './/span[@itemprop="streetAddress"]').text
         cityStateZip = info.find_element(
@@ -623,6 +658,17 @@ class redfinScraper(object):
         except NoSuchElementException:
             beds = None
         try:
+            lastSoldPrice = info.find_element(
+                By.XPATH, '''.//span[contains(text(),"Sold")]/..''') \
+                .text.split('\n')
+            lsp = lastSoldPrice[0].encode('utf-8')
+        except NoSuchElementException:
+            lsp = ''
+        if '$' not in lsp:
+            signInReqd = True
+        else:
+            signInReqd = False
+        try:
             bathsInfo = info.find_element(
                 By.XPATH, '''.//span[contains(text(),"Bath")]/..''') \
                 .text.split('\n')
@@ -642,16 +688,16 @@ class redfinScraper(object):
             yearBuilt = yearBuiltInfo[1].encode('utf-8')
         except NoSuchElementException:
             yearBuilt = None
-        try:
-            keyDetails = driver.find_element(
-                By.XPATH, '''//div[@class="keyDetailsList"]
-                /div/span[text()="MLS#"]/..''').text.split('\n')
-            if keyDetails[0] == "MLS#":
-                mls = keyDetails[1].encode('utf-8')
-            else:
-                mls = None
-        except NoSuchElementException:
-            mls = None
+        # try:
+        #     keyDetails = driver.find_element(
+        #         By.XPATH, '''//div[@class="keyDetailsList"]
+        #         /div/span[text()="MLS#"]/..''').text.split('\n')
+        #     if keyDetails[0] == "MLS#":
+        #         mls = keyDetails[1].encode('utf-8')
+        #     else:
+        #         mls = None
+        # except NoSuchElementException:
+        #     mls = None
         factsTable = driver.find_element(
             By.XPATH, '//div[@class="facts-table"]')
         factList = factsTable.text.split('\n')
@@ -674,110 +720,146 @@ class redfinScraper(object):
 
         propType = factDict['Style']
         apn = factDict['APN']
-        staticAttrs = [mls, apn, streetAddr, city, state, zipcode,
+        staticAttrs = [apn, streetAddr, city, state, zipcode,
                        lat, lon, beds, baths, sqft, lotSize, propType,
                        yearBuilt, driver.current_url]
         historyRows = driver.find_elements(
             By.XPATH, '//*[contains(@id,"propertyHistory")]')
+        if historyRows is None:
+            return None, None
         lastEvent = None
-        saleDt = None
+        saleDtStr = None
+        saleDtObj = None
         salePrice = None
         for i, historyRow in enumerate(historyRows):
-            logging.info('Working on row {0}'.format(i))
+            # logging.info('Working on row {0}'.format(i))
             if 'Sold' in historyRow.text:
-                curSaleDt = self.getEventDate(historyRow)
+                curSaleDtStr, curSaleDtObj = self.getEventDate(historyRow)
                 curSalePrice = self.getEventPrice(historyRow)
-                if lastEvent == 'sale' and curSaleDt != saleDt:
+                if (lastEvent == 'sale') and (
+                    (saleDtObj is None) or
+                    ((saleDtObj is not None) and
+                     (curSaleDtObj < saleDtObj - td(days=14)))):
                     events.append(
-                        staticAttrs + [saleDt, salePrice, None, None])
+                        staticAttrs +
+                        [saleDtStr, salePrice, None, None])
                 if i + 1 == len(historyRows):
                     events.append(
-                        staticAttrs + [curSaleDt, curSalePrice, None, None])
+                        staticAttrs + [curSaleDtStr, curSalePrice, None, None])
                 lastEvent = 'sale'
-                saleDt, salePrice = curSaleDt, curSalePrice
+                saleDtStr, saleDtObj, salePrice = \
+                    curSaleDtStr, curSaleDtObj, curSalePrice
             elif 'Listed' in historyRow.text and lastEvent == 'sale':
-                listDt = self.getEventDate(historyRow)
+                listDtStr, listDtObj = self.getEventDate(historyRow)
                 listPrice = self.getEventPrice(historyRow)
                 events.append(
-                    staticAttrs + [saleDt, salePrice, listDt, listPrice])
+                    staticAttrs + [saleDtStr, salePrice, listDtStr, listPrice])
                 lastEvent = 'listing'
             else:
                 continue
-
-        return events
+        return events, signInReqd
 
     def pickleClusterDict(self, clusterDict, zipcode):
         pickle.dump(clusterDict, open(
             'data/pickles/main_cluster_dict_{0}.pkl'.format(zipcode), 'wb'))
 
-    def writeCsv(self, outfile, row):
-        with open(outfile, 'wb') as f:
-            writer = csv.writer(f)
-            writer.writerow(row)
+    def timeElapsedLeft(self, sttm, iterNum, totalNum):
+        duration = time.time() - sttm
+        durMins = round(duration / 60.0, 1)
+        minsPerListing = durMins / (iterNum + 1)
+        minsLeft = round(minsPerListing * (totalNum - iterNum - 1), 1)
+        return durMins, minsLeft
 
-    def writeDb(self, eventList):
+    def writeEventsToCsv(self, zipcode, outfile, urls, processedUrlsFName):
+        zc = zipcode
+        numUrls = len(urls)
+        totalEvents = 0
+        zipSignInReqd = False
+
+        driver, msg = self.getChromeDriver()
+        if not driver or driver is None:
+            logging.info('No events scraped from zipcode {0}.'.format(zc))
+            logging.info(msg)
+            return None
+
+        with open(processedUrlsFName, 'w+') as pus:
+            pUrls = pus.read().split('\r\n')
+
+        with open(processedUrlsFName, 'a') as pus:
+            pUrls_writer = csv.writer(pus)
+            with open(outfile, 'wb') as f:
+                writer = csv.writer(f)
+                sttm = time.time()
+                for i, url in enumerate(urls):
+                    numEvents = 0
+                    if pUrls is not None and url in pUrls:
+                        durMins, minsLeft = self.timeElapsedLeft(
+                            sttm, i, numUrls)
+                        logging.info(
+                            'Previously scraped events from listing'
+                            ' {0} of {1}. {2} min. elapsed. '
+                            '{3} min. remaining.'.format(
+                                i + 1, numUrls, durMins, minsLeft))
+                        continue
+
+                    events, signInReqd = self.getEventsFromListingUrl(
+                        driver, url)
+                    if signInReqd:
+                        zipSignInReqd = True
+                    if events is None:
+                        durMins, minsLeft = self.timeElapsedLeft(
+                            sttm, i, numUrls)
+                        logging.info(
+                            'No sales events scraped from listing'
+                            ' {1} of {2}. Check url: {3}. {4} min. elapsed. '
+                            '{5} min. remaining.'.format(
+                                numEvents, i + 1, numUrls, url, durMins,
+                                minsLeft))
+                        continue
+                    for event in events:
+                        totalEvents += 1
+                        numEvents += 1
+                        writer.writerow(event)
+                    pUrls_writer.writerow([url])
+
+                    # time left/logging
+                    durMins, minsLeft = self.timeElapsedLeft(sttm, i, numUrls)
+                    logging.info(
+                        'Scraped {0} sales events from listing {1} of {2}.'
+                        ' Scraped {3} total sales events so far in {4} min.'
+                        ' Estimated time to completion: ~{5} min.'.format(
+                            numEvents, i + 1, numUrls, totalEvents, durMins,
+                            minsLeft))
+        logging.info('Saved {0} events to {1}'.format(numEvents, outfile))
+
+        if zipSignInReqd:
+            with open(self.zipsReqSignInFName, 'a') as f:
+                writer = csv.writer(f)
+                writer.writerow([zc])
+
+    def writeCsvToDb(self, eventCsv):
         dbname = 'redfin'
         host = 'localhost'
         port = 5432
         conn_str = "dbname={0} host={1} port={2}".format(dbname, host, port)
         conn = psycopg2.connect(conn_str)
         cur = conn.cursor()
-        num_listings = len(eventList)
-        prob_PIDs = []
-        dupes = []
-        writes = []
-        for i, row in eventList:
+        eventList = csv.reader(file(eventCsv))
+        numEvents = len(eventList)
+        numWritten = 0
+        logging.info('Writing {0} events to redfin database.')
+        for row in eventList:
             try:
-                cur.execute('''INSERT INTO sales_listings
-                            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)''',
-                                (row['pid'],row['date'].to_datetime(),row['region'],row['neighborhood'],
-                                row['rent'],row['bedrooms'],row['sqft'],row['rent_sqft'],
-                                row['longitude'],row['latitude'],row['county'],
-                                row['fips_block'],row['state'],row['bathrooms']))
+                cur.execute(
+                    'INSERT INTO sales_listings VALUES (' +
+                    ','.join(['%s'] * 18), row)
                 conn.commit()
-                writes.append(row['pid'])
             except Exception, e:
-                if 'duplicate key value violates unique' in str(e):
-                    dupes.append(row['pid'])
-                else:
-                    prob_PIDs.append(row['pid'])
+                logging.info(str(e))
                 conn.rollback()
+        pctWritten = round(numWritten / numEvents, 2) * 100
+        logging.info(
+            'Wrote {0} of {1} ({2}%) events to redfin database.'.
+            format(numWritten, numEvents, pctWritten))
         cur.close()
         conn.close()
-        return prob_PIDs, dupes, writes
-
-
-
-
-
-
-
-
-        # with open("processed_urls.csv", 'r') as pus:
-        #     urls = pus.read().split('\r\n')
-
-        # with open('processed_urls.csv', 'a') as pus:
-        #     pus_writer = csv.writer(pus)
-        #     with open(fname, 'wb') as f:
-        #         writer = csv.writer(f)
-        #         for i, url in enumerate(allZipCodeUrls):
-        #             if url in urls:
-        #                 logging.info('been there done that.')
-        #                 continue
-        #             logging.info('Scraping events for listing {0} of {1}'.format(
-        #                 i + 1, len(allZipCodeUrls)))
-        #             try:
-        #                 driver.get(url)
-        #                 events = getEventsFromListing(driver)
-        #                 for j, event in enumerate(events):
-        #                     logging.info("writing event {0} of {1}".format(
-        #                         j + 1, len(events)))
-        #                     writer.writerow(event)
-        #             except Exception, e:
-        #                 logging.info(Exception, e, url)
-        #                 break
-        #                 continue
-        #             pus_writer.writerow([url])
-        #         break
-
-
