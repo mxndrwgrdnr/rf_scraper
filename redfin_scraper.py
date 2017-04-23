@@ -8,7 +8,6 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions \
     import WebDriverException, NoSuchElementException, TimeoutException
 from selenium.webdriver.common.action_chains import ActionChains
-from selenium.webdriver.chrome.options import Options
 from itertools import izip_longest
 from datetime import datetime as dt, timedelta as td
 import logging
@@ -16,26 +15,21 @@ import time
 import pickle
 from multiprocessing import Process, Manager
 import psycopg2
-
-chrome_options = Options()
-chrome_options.add_extension("./proxy.zip")
-chrome_options.add_argument("--ignore-certificate-errors")
-chrome_options.add_argument("--window-size=1024,768")
-chrome_options.add_argument("--start-maximized")
-chrome_options.add_argument("--disable-infobars")
-sttm = dt.now().strftime('%Y%m%d-%H%M%S')
-dataDir = './data/'
+from psycopg2 import IntegrityError, InterfaceError
 
 
 class redfinScraper(object):
 
-    def __init__(self, virtualDisplay=False, subClusterMode='parallel',
-                 timeFilter='sold-all', chromeOptions=chrome_options,
-                 startTime=sttm, dataDir=dataDir):
+    def __init__(
+            self, outfile, processedUrlsFName, dataDir, startTime,
+            virtualDisplay=False, subClusterMode='parallel',
+            timeFilter='sold-all', chromeOptions=None):
 
+        self.dataDir = dataDir
+        self.outfile = self.dataDir + outfile
+        self.processedUrlsFName = self.dataDir + processedUrlsFName
         self.chromeOptions = chromeOptions
         self.startTime = startTime
-        self.dataDir = dataDir
         self.timeFilter = timeFilter
         self.subClusterMode = subClusterMode
         # self.driver = None
@@ -47,6 +41,9 @@ class redfinScraper(object):
         logging.basicConfig(filename=log_fname, level=logging.INFO)
         self.notListedFName = './not_listed.csv'
         self.zipsReqSignInFName = './zips_req_signin.csv'
+        with open(self.notListedFName, 'rb') as f:
+            reader = csv.reader(f)
+            self.not_listed = [zc for zclist in reader for zc in zclist]
 
     def getChromeDriver(self):
         try:
@@ -399,7 +396,7 @@ class redfinScraper(object):
                 clusterDict['subClusters'][j] = self.formatSubClusterDict(
                     False, None, False, None, [])
         else:
-            clusterDict = seriesDict
+            clusterDict['subClusters'] = seriesDict
         subClustersDict = clusterDict['subClusters']
         subClustersOver350 = [j for j in subClustersDict.keys()
                               if subClustersDict[j]['count'] > 345]
@@ -432,11 +429,11 @@ class redfinScraper(object):
             'Found {0} clusters in zipcode {1}.'.format(numClusters, zc))
         for i in range(numClusters):
             clusterID = i + 1
-            logging.info('*' * 90)
+            logging.info('*' * 100)
             logging.info(
                 'Processing cluster {0} of {1}'
                 ' in zipcode {2}.'.format(
-                    i + 1, numClusters, zc).center(80, ' ').center(90, '*'))
+                    i + 1, numClusters, zc).center(90, ' ').center(100, '*'))
             if (i in mainClusterDict['clusters'].keys()) and \
                (mainClusterDict['clusters'][i]['complete']):
                 logging.info(
@@ -444,26 +441,33 @@ class redfinScraper(object):
                     'of unique listings obtained.'.format(
                         i + 1, numClusters,
                         mainClusterDict['clusters'][i]['pctObtained']).
-                    center(80, ' ').center(90, '*'))
-                logging.info('*' * 90)
+                    center(90, ' ').center(100, '*'))
+                logging.info('*' * 100)
                 continue
             else:
                 if i not in mainClusterDict['clusters'].keys():
                     mainClusterDict['clusters'][i] = \
                         self.instantiateClusterDict()
-            logging.info('*' * 90)
-            assert len(clusters) == numClusters
-            assert driver.current_url == origUrl
+            # logging.info('*' * 100)
+            if len(clusters) != numClusters:
+                logging.info(
+                    'Detecting {0} clusters when I expected {1}'.format(
+                        len(clusters), numClusters))
+                # if driver.current_url != origUrl:
+                logging.info(
+                    'Current url is {0} but I should be at {1}'.format(
+                        driver.current_url, origUrl))
+                assert False
             clickable = self.clickIfClickable(
                 driver, origUrl, clusters[i], clusterID)
             mainClusterDict['clusters'][i].update({'clickable': clickable})
             if clickable is False:
-                logging.info('*' * 90)
+                # logging.info('*' * 100)
                 logging.info(
                     'Main cluster {0} from zipcode {1}'
                     ' could not be clicked.'.
-                    format(i + 1, zc).center(80, ' ').center(90, '*'))
-                logging.info('*' * 90)
+                    format(i + 1, zc).center(90, ' ').center(100, '*'))
+                logging.info('*' * 100)
                 continue
             self.waitForListingsToLoad(driver, count)
             count = self.getListingCount(driver)
@@ -480,28 +484,28 @@ class redfinScraper(object):
                     {'pctObtained': pctObtained,
                         'listingUrls': listingUrls})
             clusterInfo = mainClusterDict['clusters'][i]
-            logging.info('*' * 90)
+            # logging.info('*' * 100)
             logging.info(
                 '{0} of {1} unique listings ({2}%) '
                 'in cluster {3} from zipcode {4} were scraped.'.format(
                     len(clusterInfo['listingUrls']), count,
                     clusterInfo['pctObtained'], i + 1, zc).center(
-                    80, ' ').center(90, '*'))
+                    90, ' ').center(100, '*'))
             if clusterInfo['numSubClustersOver350'] > 0:
                 logging.info(
                     '{0} of {1} subclusters in cluster {2} '
                     'from zipcode {3} had more than 350 listings.'.format(
                         clusterInfo['numSubClustersOver350'],
                         clusterInfo['numSubClusters'], i + 1, zc).center(
-                        80, ' ').center(90, '*'))
+                        90, ' ').center(100, '*'))
             if clusterInfo['numSubClustersNotClicked'] > 0:
                 logging.info(
                     '{0} of {1} subclusters in cluster {2} '
                     'from zipcode {3} were not clicked.'.format(
                         clusterInfo['numSubClustersNotClicked'],
                         clusterInfo['numSubClusters'], i + 1, zc).center(
-                        80, ' ').center(90, '*'))
-            logging.info('*' * 90)
+                        90, ' ').center(100, '*'))
+            logging.info('*' * 100)
             logging.info('Back to main page for zipcode {0}.'.format(zc))
             driver.get(origUrl)
             self.ensureMapClickable(driver, clusterID)
@@ -592,24 +596,24 @@ class redfinScraper(object):
         mainClusterDict['listingUrls'] = list(uniqueUrls)
         totalTime = round((time.time() - sttm) / 60.0, 1)
         pctObtained = round(len(uniqueUrls) / totalListings, 3) * 100.0
-        logging.info('#' * 90)
-        logging.info('#' * 90)
+        logging.info('#' * 100)
+        logging.info('#' * 100)
         logging.info(
             '{0} of {1} of unique listings'
             ' ({2}%) from zipcode {3} were scraped.'.format(
                 len(uniqueUrls), totalListings, pctObtained,
-                zc).center(80, ' ').center(90, '#').upper())
+                zc).center(90, ' ').center(100, '#').upper())
         logging.info(
             'Took {0} min. to process zipcode {1}.'.format(
-                totalTime, zc).center(80, ' ').center(90, '#').upper())
+                totalTime, zc).center(90, ' ').center(100, '#').upper())
         if numClustersNotClicked > 0:
             logging.info(
                 '{0} of {1} main clusters from zipcode '
                 '{2} were not clicked.'.format(
                     numClustersNotClicked, numMainClusters,
-                    zc).center(80, ' ').center(90, '#').upper())
-        logging.info('#' * 90)
-        logging.info('#' * 90)
+                    zc).center(90, ' ').center(100, '#').upper())
+        logging.info('#' * 100)
+        logging.info('#' * 100)
         driver.quit()
         return mainClusterDict, 'ok'
 
@@ -830,7 +834,7 @@ class redfinScraper(object):
                         ' Estimated time to completion: ~{5} min.'.format(
                             numEvents, i + 1, numUrls, totalEvents, durMins,
                             minsLeft))
-        logging.info('Saved {0} events to {1}'.format(numEvents, outfile))
+        logging.info('Saved {0} events to {1}'.format(totalEvents, outfile))
 
         if zipSignInReqd:
             with open(self.zipsReqSignInFName, 'a') as f:
@@ -844,22 +848,52 @@ class redfinScraper(object):
         conn_str = "dbname={0} host={1} port={2}".format(dbname, host, port)
         conn = psycopg2.connect(conn_str)
         cur = conn.cursor()
-        eventList = csv.reader(file(eventCsv))
+        with open(eventCsv, "r") as f:
+            events = csv.reader(f, delimiter=',')
+            eventList = list(events)
         numEvents = len(eventList)
         numWritten = 0
-        logging.info('Writing {0} events to redfin database.')
+        logging.info('Writing {0} events to redfin database.'.format(
+            numEvents))
         for row in eventList:
+            row = [x if x not in ['', '*', '**', '-', '\xe2\x90\x94']
+                   else None for x in row]
+            if len(row) != 18:
+                continue
             try:
                 cur.execute(
                     'INSERT INTO sales_listings VALUES (' +
-                    ','.join(['%s'] * 18), row)
+                    ','.join(['%s'] * 18) + ')', row)
                 conn.commit()
-            except Exception, e:
+                numWritten += 1
+            except IntegrityError, e:
                 logging.info(str(e))
                 conn.rollback()
+                continue
+            except InterfaceError, e:
+                logging.info(str(e))
+                conn = psycopg2.connect(conn_str)
+                cur = conn.cursor()
+                continue
         pctWritten = round(numWritten / numEvents, 2) * 100
         logging.info(
             'Wrote {0} of {1} ({2}%) events to redfin database.'.
             format(numWritten, numEvents, pctWritten))
         cur.close()
         conn.close()
+        return
+
+    def run(self, zipcode):
+        zc = zipcode
+        mainClusterDict, msg = self.getUrlsByZipCode(zc)
+        if not mainClusterDict:
+            if msg == 'out of area':
+                self.not_listed += [zc]
+            return
+        else:
+            self.pickleClusterDict(mainClusterDict, zc)
+        allZipCodeUrls = mainClusterDict['listingUrls']
+        self.writeEventsToCsv(
+            zc, self.outfile, allZipCodeUrls, self.processedUrlsFName)
+        self.writeCsvToDb(self.outfile)
+        return

@@ -2,16 +2,21 @@ import csv
 import redfin_scraper
 from pyzipcode import ZipCodeDatabase
 from datetime import datetime as dt
-
-rf = redfin_scraper.redfinScraper(
-    virtualDisplay=True, subClusterMode='parallel',
-    timeFilter='sold-all')
+from selenium.webdriver.chrome.options import Options
+import multiprocessing
 
 zcdb = ZipCodeDatabase()
 # zips = [zc.zip for zc in zcdb.find_zip()]
-zips = ['94609']
+zips = ['73103']
 sttm = dt.now().strftime('%Y%m%d-%H%M%S')
 dataDir = './data'
+chrome_options = Options()
+chrome_options.add_extension("./proxy.zip")
+chrome_options.add_argument("--ignore-certificate-errors")
+chrome_options.add_argument("--window-size=1024,768")
+chrome_options.add_argument("--start-maximized")
+chrome_options.add_argument("--disable-infobars")
+sttm = dt.now().strftime('%Y%m%d-%H%M%S')
 
 with open('not_listed.csv', 'rb') as f:
     reader = csv.reader(f)
@@ -19,20 +24,15 @@ with open('not_listed.csv', 'rb') as f:
 
 for zc in zips:
 
-    outfile = dataDir + '/historic_sales/events_' + zc + '_' + sttm + '.csv'
-    processedUrlsFName = dataDir + '/processed_urls/processed_urls_' + \
-        zc + '.csv'
     if zc in not_listed:
         continue
 
-    mainClusterDict, msg = rf.getUrlsByZipCode(zc)
-    if not mainClusterDict:
-        if msg == 'out of area':
-            not_listed += [zc]
-    else:
-        rf.pickleClusterDict(mainClusterDict, zc)
+    outfile = '/historic_sales/events_' + zc + '_' + sttm + '.csv'
+    processedUrlsFName = '/processed_urls/processed_urls_' + zc + '.csv'
 
-    allZipCodeUrls = mainClusterDict['listingUrls']
-    rf.writeEventsToCsv(zc, outfile, allZipCodeUrls, processedUrlsFName)
-    rf.writeCsvToDb(outfile)
-    break
+    rf = redfin_scraper.redfinScraper(
+        outfile, processedUrlsFName, virtualDisplay=True,
+        subClusterMode='series', timeFilter='sold-all',
+        dataDir=dataDir, startTime=sttm)
+
+    rf.run(zc)
