@@ -32,7 +32,6 @@ class redfinScraper(object):
         self.startTime = startTime
         self.timeFilter = timeFilter
         self.subClusterMode = subClusterMode
-        # self.driver = None
         if virtualDisplay:
             display = Display(visible=0, size=(1024, 768))
             display.start()
@@ -44,6 +43,7 @@ class redfinScraper(object):
         with open(self.notListedFName, 'rb') as f:
             reader = csv.reader(f)
             self.not_listed = [zc for zclist in reader for zc in zclist]
+        self.mainDriver = None
 
     def getChromeDriver(self):
         try:
@@ -248,13 +248,32 @@ class redfinScraper(object):
         if not len(self.getClusters(driver)):
             driver.refresh()
 
+    def closeExtraTabs(self, driver):
+        if len(driver.window_handles) > 1:
+            mainWindow = driver.window_handles[0]
+            for window in driver.window_handles[1:]:
+                driver.switch_to.window(window_name=window)
+                driver.close()
+                driver.switch_to.window(window_name=mainWindow)
+        assert len(driver.window_handles) == 1
+
+    def getFeaturedListingUrl(self, driver):
+        linkElem = driver.find_element(
+            By.XPATH, '//div[@id="listing-preview"]//a[@class="link"]')
+        url = linkElem.get_attribute('href')
+        return url
+
     def getListingCount(self, driver):
         elemText = driver.find_elements(
             By.XPATH, '//div[@class="homes summary"]')[0].text
         if 'of' in elemText:
             countStr = elemText.split('of')[1].split('Homes')[0].strip()
-        else:
+        elif 'Showing' in elemText:
             countStr = elemText.split()[1]
+        elif len(elemText) == 2:
+            countStr = elemText.split()[0]
+        else:
+            return 0
         assert countStr.isdigit()
         return int(countStr)
 
@@ -424,25 +443,25 @@ class redfinScraper(object):
         numClusters = len(clusters)
         mainClusterDict.update({'numClusters': numClusters})
         count = self.getListingCount(driver)
+        featuredListingUrl = self.getFeaturedListingUrl(driver)
 
         logging.info(
             'Found {0} clusters in zipcode {1}.'.format(numClusters, zc))
         for i in range(numClusters):
             clusterID = i + 1
-            logging.info('*' * 100)
+            # logging.info('*' * 100)
             logging.info(
                 'Processing cluster {0} of {1}'
                 ' in zipcode {2}.'.format(
-                    i + 1, numClusters, zc).center(90, ' ').center(100, '*'))
+                    i + 1, numClusters, zc))
             if (i in mainClusterDict['clusters'].keys()) and \
                (mainClusterDict['clusters'][i]['complete']):
                 logging.info(
                     'Cluster {0} of {1} already processed with {2}% '
                     'of unique listings obtained.'.format(
                         i + 1, numClusters,
-                        mainClusterDict['clusters'][i]['pctObtained']).
-                    center(90, ' ').center(100, '*'))
-                logging.info('*' * 100)
+                        mainClusterDict['clusters'][i]['pctObtained']))
+                # logging.info('*' * 100)
                 continue
             else:
                 if i not in mainClusterDict['clusters'].keys():
@@ -451,18 +470,20 @@ class redfinScraper(object):
             # logging.info('*' * 100)
             if len(clusters) != numClusters:
                 logging.info(
-                    'Detecting {0} clusters when I expected {1}'.format(
+                    'Got {0} clusters when {1} were expected. Checking'
+                    'for extra tabs and closing any.'.format(
                         len(clusters), numClusters))
-                # if driver.current_url != origUrl:
-                logging.info(
-                    'Current url is {0} but I should be at {1}'.format(
-                        driver.current_url, origUrl))
-                assert False
+                self.closeExtraTabs(driver)
+                clusters = self.getClusters(driver) 
+                if len(clusters) != numClusters:
+                    driver.refresh()
+                clusters = self.getClusters(driver)
+                assert len(clusters) == numClusters
             clickable = self.clickIfClickable(
                 driver, origUrl, clusters[i], clusterID)
             mainClusterDict['clusters'][i].update({'clickable': clickable})
             if clickable is False:
-                # logging.info('*' * 100)
+                logging.info('*' * 100)
                 logging.info(
                     'Main cluster {0} from zipcode {1}'
                     ' could not be clicked.'.
@@ -484,7 +505,7 @@ class redfinScraper(object):
                     {'pctObtained': pctObtained,
                         'listingUrls': listingUrls})
             clusterInfo = mainClusterDict['clusters'][i]
-            # logging.info('*' * 100)
+            logging.info('*' * 100)
             logging.info(
                 '{0} of {1} unique listings ({2}%) '
                 'in cluster {3} from zipcode {4} were scraped.'.format(
@@ -561,6 +582,7 @@ class redfinScraper(object):
         allZipCodeUrls = []
         logging.info("Getting driver for zipcode {0}.".format(zc))
         driver, msg = self.goToRedfin(zc)
+        self.mainDriver = driver
         if not driver:
             logging.info(msg)
             return False, msg
@@ -614,7 +636,7 @@ class redfinScraper(object):
                     zc).center(90, ' ').center(100, '#').upper())
         logging.info('#' * 100)
         logging.info('#' * 100)
-        driver.quit()
+        # driver.quit()
         return mainClusterDict, 'ok'
 
     def getEventDate(self, htmlEventElement):
@@ -765,7 +787,7 @@ class redfinScraper(object):
 
     def pickleClusterDict(self, clusterDict, zipcode):
         pickle.dump(clusterDict, open(
-            'data/pickles/main_cluster_dict_{0}.pkl'.format(zipcode), 'wb'))
+            'data/pickles/main_cluster_dict_{0}.pkl'.format(zipcode), 'w+'))
 
     def timeElapsedLeft(self, sttm, iterNum, totalNum):
         duration = time.time() - sttm
@@ -830,7 +852,7 @@ class redfinScraper(object):
                     durMins, minsLeft = self.timeElapsedLeft(sttm, i, numUrls)
                     logging.info(
                         'Scraped {0} sales events from listing {1} of {2}.'
-                        ' Scraped {3} total sales events so far in {4} min.'
+                        ' Scraped {3} total sales events in {4} min.'
                         ' Estimated time to completion: ~{5} min.'.format(
                             numEvents, i + 1, numUrls, totalEvents, durMins,
                             minsLeft))

@@ -31,8 +31,8 @@ for zc in zips:
     processedUrlsFName = '/processed_urls/processed_urls_' + zc + '.csv'
 
     rf = redfin_scraper.redfinScraper(
-        outfile, processedUrlsFName, virtualDisplay=True,
+        outfile, processedUrlsFName, virtualDisplay=False,
         subClusterMode='series', timeFilter='sold-all',
         dataDir=dataDir, startTime=sttm)
 
-    rf.run(zc)
+    driver = rf.run(zc)
