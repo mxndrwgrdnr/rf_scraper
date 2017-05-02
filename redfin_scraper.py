@@ -6,16 +6,22 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions \
-    import WebDriverException, NoSuchElementException, TimeoutException
+    import WebDriverException, NoSuchElementException, TimeoutException, \
+    StaleElementReferenceException
 from selenium.webdriver.common.action_chains import ActionChains
 from itertools import izip_longest
 from datetime import datetime as dt, timedelta as td
 import logging
 import time
 import pickle
-from multiprocess import Process, Manager, Pool, TimeoutError
+from Queue import Empty
+from multiprocess import Process, Manager, Queue
 import psycopg2
 from psycopg2 import IntegrityError, InterfaceError
+import errno
+from socket import error as socket_error
+import os
+os.environ["DBUS_SESSION_BUS_ADDRESS"] = '/dev/null'
 
 
 class redfinScraper(object):
@@ -47,14 +53,26 @@ class redfinScraper(object):
         self.mainDriver = None
         self.mainClusterDict = None
         self.listingUrls = None
-        self.pctUrlsScraped = 0
-        self.pctUrlsWithEvents = 0
-        self.pctEventsWritten = 0
+        self.pctUrlsScraped = None
+        self.pctUrlsWithEvents = None
+        self.pctEventsWritten = None
+        self.eventList = None
 
     def getChromeDriver(self):
         try:
             driver = webdriver.Chrome(chrome_options=self.chromeOptions)
         except WebDriverException as e:
+            return False, str(e)
+        except socket_error as serr:
+            if serr.errno != errno.ECONNREFUSED:
+                raise serr
+            else:
+                try:
+                    driver = webdriver.Chrome(
+                        chrome_options=self.chromeOptions)
+                except WebDriverException as e:
+                    return False, str(e)
+        except Exception as e:
             return False, str(e)
         return driver, 'ok'
 
@@ -225,25 +243,33 @@ class redfinScraper(object):
             "/filter/include=" + self.timeFilter
         driver.get(url)
         self.switchToTableView(driver)
+        if driver.current_url == \
+           'https://www.redfin.com/out-of-area-signup':
+            with open(self.notListedFName, 'a') as f:
+                writer = csv.writer(f)
+                writer.writerow([zc])
+            driver.quit()
+            return False, 'Zipcode {0} out of area'.format(zc)
         mapClickable, msg = self.ensureMapClickable(driver)
         if not mapClickable:
             return False, msg
+            driver.quit()
         return driver, 'ok'
 
     def goToRedfinViewport(self, url, zipOrClusterId=False):
         if not zipOrClusterId:
             zipOrClusterId = url
-        driver, msg = self.getChromeDriver()
-        if not driver:
+        scDriver, msg = self.getChromeDriver()
+        if not scDriver:
             return False, msg
-        driver.get(url)
-        self.switchToTableView(driver)
-        mapClickable, msg = self.ensureMapClickable(driver, zipOrClusterId)
+        scDriver.get(url)
+        self.switchToTableView(scDriver)
+        mapClickable, msg = self.ensureMapClickable(scDriver, zipOrClusterId)
         if not mapClickable:
-            driver.quit()
+            scDriver.quit()
             return False, msg
         else:
-            return driver, 'ok'
+            return scDriver, 'ok'
 
     def waitForListingsToLoad(self, driver, count):
         newCount = self.getListingCount(driver)
@@ -627,15 +653,6 @@ class redfinScraper(object):
             logging.info(msg)
             return False, msg
         logging.info("Got driver for zipcode {0}.".format(zc))
-        if driver.current_url == \
-                'https://www.redfin.com/out-of-area-signup':
-            logging.info(
-                'No landing page for zipcode {0}. Out of area.'.format(zc))
-            with open(self.notListedFName, 'a') as f:
-                writer = csv.writer(f)
-                writer.writerow([zc])
-            driver.quit()
-            return False, 'out of area'
         totalListings = self.getListingCount(driver)
         logging.info(
             'Found {0} listings in zipcode {1}.'.format(totalListings, zc))
@@ -644,7 +661,7 @@ class redfinScraper(object):
         if totalListings < 345:
             uniqueUrls = self.getAllUrls(driver)
             numMainClusters = 0
-            clustersNotClicked = 0
+            numClustersNotClicked = 0
         else:
             self.checkForClusters(driver)
             self.getMainClusters(driver, mainClusterDict, zc)
@@ -694,22 +711,29 @@ class redfinScraper(object):
             .text.strip('$').replace(',', '')
         return price.encode('utf-8')
 
-    def getEventsFromListingUrl(self, url):
-        events = []
+    def getEventSource(self, htmlEventElement):
+        source = htmlEventElement.find_element(
+            By.XPATH, './/div[@class="source-info"]/span[@class="source"]')
+        return source.text.encode('utf-8')
+
+    def getEventsFromListingUrl(self, url, iter_num, total_num, sttm,
+                                eventQueue, urlList, timeoutList, eventsSaved):
+        numEvents = 0
         eventDriver, msg = self.getChromeDriver()
         if not eventDriver:
             logging.info('Chrome could not connect to listing page {0}'.format(
                 url))
-            return None
-        eventDriver.set_page_load_timeout(120)
+            return
+        eventDriver.set_page_load_timeout(160)
         try:
             eventDriver.get(url)
         except TimeoutException:
             logging.info(
                 'Chrome timed out trying to get the listing at {0}'.format(
                     url))
+            timeoutList.append(url)
             eventDriver.quit()
-            return None
+            return
         try:
             info = eventDriver.find_element(
                 By.XPATH, '//div[contains(@class, "main-stats inline-block")]')
@@ -717,23 +741,33 @@ class redfinScraper(object):
             logging.info('No property stats detected at {0}'.format(
                 url))
             eventDriver.quit()
-            return None
-        streetAddr = info.find_element(
-            By.XPATH, './/span[@itemprop="streetAddress"]').text
-        cityStateZip = info.find_element(
-            By.XPATH, './/span[@class="citystatezip"]')
-        city = cityStateZip.find_element(
-            By.XPATH, './/span[@class="locality"]').text.strip(',')
-        state = cityStateZip.find_element(
-            By.XPATH, './/span[@class="region"]').text
-        zipcode = cityStateZip.find_element(
-            By.XPATH, './/span[@class="postal-code"]').text
-        lat = info.find_element(
-            By.XPATH, './/span[@itemprop="geo"]/meta[@itemprop="latitude"]') \
-            .get_attribute('content')
-        lon = info.find_element(
-            By.XPATH, './/span[@itemprop="geo"]/meta[@itemprop="longitude"]') \
-            .get_attribute('content')
+            return
+        try:
+            streetAddr = info.find_element(
+                By.XPATH, './/span[@itemprop="streetAddress"]').text
+        except StaleElementReferenceException:
+            logging.info('Stale element error at {0}'.format(url))
+            return
+        try:
+            cityStateZip = info.find_element(
+                By.XPATH, './/span[@class="citystatezip"]')
+            city = cityStateZip.find_element(
+                By.XPATH, './/span[@class="locality"]').text.strip(',')
+            state = cityStateZip.find_element(
+                By.XPATH, './/span[@class="region"]').text
+            zipcode = cityStateZip.find_element(
+                By.XPATH, './/span[@class="postal-code"]').text
+            lat = info.find_element(
+                By.XPATH,
+                './/span[@itemprop="geo"]/meta[@itemprop="latitude"]') \
+                .get_attribute('content')
+            lon = info.find_element(
+                By.XPATH,
+                './/span[@itemprop="geo"]/meta[@itemprop="longitude"]') \
+                .get_attribute('content')
+        except NoSuchElementException:
+            logging.info('No locational stats detected at {0}'.format(url))
+            return
         try:
             bedsInfo = info.find_element(
                 By.XPATH, '''.//span[contains(text(),"Bed")]/..''') \
@@ -741,17 +775,6 @@ class redfinScraper(object):
             beds = bedsInfo[0].encode('utf-8')
         except NoSuchElementException:
             beds = None
-        # try:
-        #     lastSoldPrice = info.find_element(
-        #         By.XPATH, '''.//span[contains(text(),"Sold")]/..''') \
-        #         .text.split('\n')
-        #     lsp = lastSoldPrice[0].encode('utf-8')
-        # except NoSuchElementException:
-        #     lsp = ''
-        # if '$' not in lsp:
-        #     signInReqd = True
-        # else:
-        #     signInReqd = False
         try:
             bathsInfo = info.find_element(
                 By.XPATH, '''.//span[contains(text(),"Bath")]/..''') \
@@ -772,16 +795,7 @@ class redfinScraper(object):
             yearBuilt = yearBuiltInfo[1].encode('utf-8')
         except NoSuchElementException:
             yearBuilt = None
-        # try:
-        #     keyDetails = driver.find_element(
-        #         By.XPATH, '''//div[@class="keyDetailsList"]
-        #         /div/span[text()="MLS#"]/..''').text.split('\n')
-        #     if keyDetails[0] == "MLS#":
-        #         mls = keyDetails[1].encode('utf-8')
-        #     else:
-        #         mls = None
-        # except NoSuchElementException:
-        #     mls = None
+
         factsTable = eventDriver.find_element(
             By.XPATH, '//div[@class="facts-table"]')
         factList = factsTable.text.split('\n')
@@ -803,7 +817,10 @@ class redfinScraper(object):
             yearBuilt = factDict['Year Built']
 
         propType = factDict['Style']
-        apn = factDict['APN']
+        try:
+            apn = factDict['APN']
+        except KeyError:
+            apn = None
         staticAttrs = [apn, streetAddr, city, state, zipcode,
                        lat, lon, beds, baths, sqft, lotSize, propType,
                        yearBuilt, eventDriver.current_url]
@@ -813,38 +830,54 @@ class redfinScraper(object):
             logging.info('No property history at {0}'.format(
                 url))
             eventDriver.quit()
-            return None
+            return
         lastEvent = None
         saleDtStr = None
         saleDtObj = None
         salePrice = None
+        saleMLS = None
         for i, historyRow in enumerate(historyRows):
             if 'Sold' in historyRow.text:
                 curSaleDtStr, curSaleDtObj = self.getEventDate(historyRow)
                 curSalePrice = self.getEventPrice(historyRow)
+                curSaleMLS = self.getEventSource(historyRow)
                 if (lastEvent == 'sale') and (
                     (saleDtObj is None) or
                     ((saleDtObj is not None) and
                      (curSaleDtObj < saleDtObj - td(days=14)))):
-                    events.append(
+                    eventQueue.put(
                         staticAttrs +
-                        [saleDtStr, salePrice, None, None])
+                        [saleDtStr, salePrice, None, None, saleMLS])
+                    numEvents += 1
                 if i + 1 == len(historyRows):
-                    events.append(
-                        staticAttrs + [curSaleDtStr, curSalePrice, None, None])
+                    eventQueue.put(
+                        staticAttrs +
+                        [curSaleDtStr, curSalePrice, None, None, curSaleMLS])
+                    numEvents += 1
                 lastEvent = 'sale'
-                saleDtStr, saleDtObj, salePrice = \
-                    curSaleDtStr, curSaleDtObj, curSalePrice
+                saleDtStr, saleDtObj, salePrice, saleMLS = \
+                    curSaleDtStr, curSaleDtObj, curSalePrice, curSaleMLS
             elif 'Listed' in historyRow.text and lastEvent == 'sale':
                 listDtStr, listDtObj = self.getEventDate(historyRow)
                 listPrice = self.getEventPrice(historyRow)
-                events.append(
-                    staticAttrs + [saleDtStr, salePrice, listDtStr, listPrice])
+                eventQueue.put(
+                    staticAttrs +
+                    [saleDtStr, salePrice, listDtStr, listPrice, saleMLS])
+                numEvents += 1
                 lastEvent = 'listing'
             else:
                 continue
         eventDriver.quit()
-        return events
+        durMins, minsLeft = self.timeElapsedLeft(sttm, iter_num + 1, total_num)
+        if (i + 1) % 10 == 0:
+            logging.info(
+                'Scraped {0} sales events from listing {1} of {2}.'
+                ' Saved {3} total sales events in {4} min.'
+                ' Estimated time to completion: ~{5} min.'.format(
+                    numEvents, iter_num + 1, total_num, eventsSaved,
+                    durMins, minsLeft))
+        urlList.append(url)
+        return
 
     def pickleClusterDict(self, clusterDict, zipcode):
         pickle.dump(clusterDict, open(
@@ -856,6 +889,26 @@ class redfinScraper(object):
         minsPerListing = durMins / (iterNum + 1)
         minsLeft = round(minsPerListing * (totalNum - iterNum - 1), 1)
         return durMins, minsLeft
+
+    def eventWorker(self, queue):
+        while not queue.empty():
+            task = queue.get()
+            url, i, numUrls, sttm, eventQueue, \
+                urlList, timeoutList, eventsSaved = task
+            self.getEventsFromListingUrl(
+                url, i, numUrls, sttm, eventQueue, urlList, timeoutList,
+                eventsSaved.value)
+
+    def writeToCsvWorker(self, queue, eventsSaved):
+        with open(self.eventFile, 'a+') as f:
+            writer = csv.writer(f)
+            while True:
+                try:
+                    event = queue.get(block=True)
+                    writer.writerow(event)
+                    eventsSaved.value += 1
+                except Empty:
+                    break
 
     def writeEventsToCsv(self, urls, processedUrlsFName):
         numUrls = len(urls)
@@ -880,36 +933,39 @@ class redfinScraper(object):
                 sttm = time.time()
 
                 if self.eventMode == 'parallel':
-                    pool = Pool(24, maxtasksperchild=1)
-                    results = pool.imap(
-                        self.getEventsFromListingUrl, urls, chunksize=1)
-                    pool.close()
+                    manager = Manager()
+                    timeoutList = manager.list()
+                    urlList = manager.list(urls)
+                    queue = Queue()
+                    eventQueue = manager.Queue()
+                    eventsSaved = manager.Value('i', 0)
+                    jobs = []
                     for i, url in enumerate(urls):
-                        numEvents = 0
-                        try:
-                            events = results.next(180)
-                        except TimeoutError:
+                        queue.put(
+                            [url, i, numUrls, sttm, eventQueue, urlList,
+                             timeoutList, eventsSaved])
+                    for i in range(min(24, numUrls)):
+                        proc = Process(target=self.eventWorker, args=(queue,))
+                        proc.start()
+                        jobs.append(proc)
+                    writeProc = Process(target=self.writeToCsvWorker, args=(
+                        eventQueue, eventsSaved))
+                    time.sleep(2)
+                    writeProc.start()
+                    for j, job in enumerate(jobs):
+                        # 5 seconds per url for each process before timeout
+                        job.join(max(60, 5 * numUrls))
+                        if job.is_alive():
+                            job.terminate()
                             logging.info(
-                                'Subprocess timed out scraping events from '
-                                'listing {0} of {1} at {2}'.format(
-                                    i + 1, numUrls, url))
-                            continue
-                        if events is None:
-                            continue
-                        for event in events:
-                            totalEvents += 1
-                            numEvents += 1
-                            writer.writerow(event)
-                        urlsWithEvents += 1
+                                'Subprocess {0} of {1} timed out'.format(
+                                    j + 1, min(24, numUrls)))
+                    writeProc.join(max(60, 8 * numUrls))
+                    totalEvents = eventsSaved.value
+                    for url in set(list(urlList)):
                         pUrls_writer.writerow([url])
-                        durMins, minsLeft = self.timeElapsedLeft(
-                            sttm, i, numUrls)
-                        logging.info(
-                            'Scraped {0} sales events from listing {1} of {2}.'
-                            ' Scraped {3} total sales events in {4} min.'
-                            ' Estimated time to completion: ~{5} min.'.format(
-                                numEvents, i + 1, numUrls, totalEvents,
-                                durMins, minsLeft))
+                    urlsWithEvents = len(set(list(urlList)))
+                    numTimeouts = len(set(list(timeoutList)))
 
                 else:
                     for i, url in enumerate(urls):
@@ -933,14 +989,19 @@ class redfinScraper(object):
                         pUrls_writer.writerow([url])
                         durMins, minsLeft = self.timeElapsedLeft(
                             sttm, i, numUrls)
-                        logging.info(
-                            'Scraped {0} sales events from listing {1} of {2}.'
-                            ' Scraped {3} total sales events in {4} min.'
-                            ' Estimated time to completion: ~{5} min.'.format(
-                                numEvents, i + 1, numUrls, totalEvents,
-                                durMins, minsLeft))
-
-        self.pctUrlsWithEvents = round(urlsWithEvents / numUrls, 1) * 100
+                        if (i + 1) % 10 == 0:
+                            logging.info(
+                                'Scraped {0} sales events from listing {1}'
+                                ' of {2}. Scraped {3} total sales events in'
+                                ' {4} min. Estimated time to completion:'
+                                ' ~{5} min.'.format(
+                                    numEvents, i + 1, numUrls, totalEvents,
+                                    durMins, minsLeft))
+        if numUrls > 0:
+            self.pctUrlsWithEvents = round(
+                urlsWithEvents / numUrls, 1) * 100
+        else:
+            self.pctUrlsWithEvents = -999
 
         logging.info('#' * 100)
         logging.info('#' * 100)
@@ -949,9 +1010,13 @@ class redfinScraper(object):
                 urlsWithEvents, numUrls, self.pctUrlsWithEvents).center(
                 90, ' ').center(100, '#').upper())
         logging.info(
-            ('Saved {0} events to'.format(
-                totalEvents).upper() + ' {0}'.format(
-                self.eventFile)).center(90, ' ').center(100, '#'))
+            ('{0} of {1} urls timed out while scraping events.'.format(
+                numTimeouts, numUrls).upper().center(90, ' ').center(
+                100, '#')))
+        logging.info(
+            ('Saved {0} events to {1}'.format(
+                totalEvents, self.eventFile).upper().center(
+                90, ' ').center(100, '#')))
         logging.info('#' * 100)
         logging.info('#' * 100)
 
@@ -967,21 +1032,25 @@ class redfinScraper(object):
             eventList = list(events)
         numEvents = len(eventList)
         numWritten = 0
+        dupes = 0
         logging.info('Writing {0} events to redfin database.'.format(
             numEvents))
         for row in eventList:
-            row = [x if x not in ['', '*', '**', '-', '\xe2\x90\x94']
+            row = [x if x not in ['', '*', '**', '-', '\xe2\x80\x94']
                    else None for x in row]
-            if len(row) != 18:
+            if len(row) != 19:
                 continue
             insertStr = 'INSERT INTO sales_listings VALUES (' + \
-                ','.join(['%s'] * 18) + ')'
+                ','.join(['%s'] * 19) + ')'
             try:
                 cur.execute(insertStr, row)
                 conn.commit()
                 numWritten += 1
-            except IntegrityError, e:
-                logging.info(str(e))
+            except IntegrityError as e:
+                if str(e.pgcode) == '23505':
+                    dupes += 1
+                else:
+                    logging.info(str(e.pgerror))
                 conn.rollback()
                 continue
             except InterfaceError, e:
@@ -989,20 +1058,31 @@ class redfinScraper(object):
                 conn = psycopg2.connect(conn_str)
                 cur = conn.cursor()
                 continue
-        self.pctEventsWritten = round(numWritten / numEvents, 2) * 100
+        if numEvents > 0:
+            self.pctEventsWritten = round(numWritten / numEvents, 2) * 100
+        else:
+            self.pctEventsWritten = -999
+        logging.info('#' * 100)
+        logging.info('#' * 100)
         logging.info(
             'Wrote {0} of {1} ({2}%) events to redfin database.'.
-            format(numWritten, numEvents, self.pctEventsWritten))
+            format(numWritten, numEvents, self.pctEventsWritten).upper(
+            ).center(90, ' ').center(100, '#'))
+        logging.info(
+            '{0} of {1} events were duplicates.'.
+            format(dupes, numEvents).upper(
+            ).center(90, ' ').center(100, '#'))
+        logging.info('#' * 100)
+        logging.info('#' * 100)
         cur.close()
         conn.close()
         return
 
     def run(self, zipcode):
+        sttm = time.time()
         zc = zipcode
         mainClusterDict, msg = self.getUrlsByZipCode(zc)
         if not mainClusterDict:
-            if msg == 'out of area':
-                self.not_listed += [zc]
             return
         else:
             self.mainClusterDict = mainClusterDict
@@ -1011,4 +1091,11 @@ class redfinScraper(object):
         self.listingUrls = allZipCodeUrls
         self.writeEventsToCsv(allZipCodeUrls, self.processedUrlsFName)
         self.writeCsvToDb()
+        dur = round(time.time() - sttm / 60.0, 1)
+        logging.info('%' * 100)
+        logging.info('%' * 100)
+        logging.info('Took {0} minutes to process zipcode {1}'.format(
+            dur, zc).upper().center(90, ' ').center(100, '%'))
+        logging.info('%' * 100)
+        logging.info('%' * 100)
         return
