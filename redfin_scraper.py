@@ -7,17 +7,16 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions \
     import WebDriverException, NoSuchElementException, TimeoutException, \
-    StaleElementReferenceException
+    StaleElementReferenceException, ElementNotVisibleException
 from selenium.webdriver.common.action_chains import ActionChains
 from itertools import izip_longest
 from datetime import datetime as dt, timedelta as td
 import logging
 import time
 import pickle
-from Queue import Empty
 from multiprocess import Process, Manager, Queue
 import psycopg2
-from psycopg2 import IntegrityError, InterfaceError
+from psycopg2 import IntegrityError, InterfaceError, DataError
 import errno
 from socket import error as socket_error
 import os
@@ -109,7 +108,7 @@ class redfinScraper(object):
                 '/buy-a-home/classes-and-events"]')
             popup.find_element(By.XPATH, '../../../img').click()
             return
-        except NoSuchElementException:
+        except (NoSuchElementException, ElementNotVisibleException):
             return
 
     def checkForMap(self, driver, zipOrClusterId=False):
@@ -285,6 +284,9 @@ class redfinScraper(object):
     def checkForClusters(self, driver):
         if not len(self.getClusters(driver)):
             driver.refresh()
+            return False
+        else:
+            return True
 
     def closeExtraTabs(self, driver):
         if len(driver.window_handles) > 1:
@@ -403,16 +405,11 @@ class redfinScraper(object):
         self.waitForListingsToLoad(scDriver, mainClusterCount)
         count = self.getListingCount(scDriver)
         url = scDriver.current_url
-        if count > 345:
-            logging.info(
-                'Subcluster {0} had more than 350 listings.'.format(
-                    subClusterID))
-        else:
-            listingUrls = self.getAllUrls(scDriver)
-            pctObtained = round(len(listingUrls) / count, 2) * 100
-            logging.info(
-                'Subcluster {3} returned {0} of {1} ({2}%) listing urls.'.
-                format(len(listingUrls), count, pctObtained, subClusterID))
+        listingUrls = self.getAllUrls(scDriver)
+        pctObtained = round(len(listingUrls) / count * 100, 1)
+        logging.info(
+            'Subcluster {3} returned {0} of {1} ({2}%) listing urls.'.
+            format(len(listingUrls), count, pctObtained, subClusterID))
         complete = True
         IODict[j] = self.formatSubClusterDict(
             complete, url, clickable, count, listingUrls)
@@ -483,7 +480,7 @@ class redfinScraper(object):
         for j in subClustersDict.keys():
             allListingUrls += subClustersDict[j]['listingUrls']
         uniqueUrls = set(allListingUrls)
-        pctObtained = round(len(uniqueUrls) / count, 3) * 100
+        pctObtained = round(len(uniqueUrls) / count * 100, 3)
         clusterDict.update(
             {'subClustersOver350': subClustersOver350,
                 'numSubClustersOver350': numSubClustersOver350,
@@ -566,7 +563,7 @@ class redfinScraper(object):
                     driver, mainClusterDict, i, zipcode)
             else:
                 listingUrls = self.getAllUrls(driver)
-                pctObtained = round(len(listingUrls) / count, 3) * 100.0
+                pctObtained = round(len(listingUrls) / count * 100, 1)
                 mainClusterDict['clusters'][i].update(
                     {'pctObtained': pctObtained,
                         'listingUrls': listingUrls})
@@ -656,14 +653,17 @@ class redfinScraper(object):
         totalListings = self.getListingCount(driver)
         logging.info(
             'Found {0} listings in zipcode {1}.'.format(totalListings, zc))
+        if totalListings == 0:
+            return False, 'No listings.'
         sttm = time.time()
         mainClusterDict = self.instantiateMainClusterDict(zc)
-        if totalListings < 345:
+        foundClusters = self.checkForClusters(driver)
+        if (totalListings < 345) or \
+           (foundClusters is False and totalListings >= 345):
             uniqueUrls = self.getAllUrls(driver)
             numMainClusters = 0
             numClustersNotClicked = 0
         else:
-            self.checkForClusters(driver)
             self.getMainClusters(driver, mainClusterDict, zc)
             numMainClusters = mainClusterDict['numClusters']
             clustersDict = mainClusterDict['clusters']
@@ -675,7 +675,7 @@ class redfinScraper(object):
             uniqueUrls = set(allZipCodeUrls)
         mainClusterDict['listingUrls'] = list(uniqueUrls)
         totalTime = round((time.time() - sttm) / 60.0, 1)
-        pctObtained = round(len(uniqueUrls) / totalListings, 3) * 100.0
+        pctObtained = round(len(uniqueUrls) / totalListings * 100.0, 1)
         logging.info('#' * 100)
         logging.info('#' * 100)
         logging.info(
@@ -869,13 +869,11 @@ class redfinScraper(object):
                 continue
         eventDriver.quit()
         durMins, minsLeft = self.timeElapsedLeft(sttm, iter_num + 1, total_num)
-        if (i + 1) % 10 == 0:
+        if (iter_num + 1) % 10 == 0:
             logging.info(
-                'Scraped {0} sales events from listing {1} of {2}.'
-                ' Saved {3} total sales events in {4} min.'
-                ' Estimated time to completion: ~{5} min.'.format(
-                    numEvents, iter_num + 1, total_num, eventsSaved,
-                    durMins, minsLeft))
+                'Saved {0} total sales events from {1} listings in {2} min. '
+                'elapsed. Estimated time to completion: ~{3} min.'.format(
+                    eventsSaved.value, iter_num + 1, durMins, minsLeft))
         urlList.append(url)
         return
 
@@ -891,27 +889,33 @@ class redfinScraper(object):
         return durMins, minsLeft
 
     def eventWorker(self, queue):
-        while not queue.empty():
-            task = queue.get()
+        while True:
+            try:
+                task = queue.get(timeout=30)
+            except Exception:
+                logging.info('eventWorker got to the end of the queue.')
+                return
             url, i, numUrls, sttm, eventQueue, \
                 urlList, timeoutList, eventsSaved = task
             self.getEventsFromListingUrl(
                 url, i, numUrls, sttm, eventQueue, urlList, timeoutList,
-                eventsSaved.value)
+                eventsSaved)
 
     def writeToCsvWorker(self, queue, eventsSaved):
         with open(self.eventFile, 'a+') as f:
             writer = csv.writer(f)
             while True:
                 try:
-                    event = queue.get(block=True)
-                    writer.writerow(event)
-                    eventsSaved.value += 1
-                except Empty:
-                    break
+                    event = queue.get(timeout=160)
+                except Exception:
+                    logging.info('writeToCsvWorker finished saving events.')
+                    return
+                writer.writerow(event)
+                eventsSaved.value += 1
 
     def writeEventsToCsv(self, urls, processedUrlsFName):
         numUrls = len(urls)
+        origNumUrls = numUrls
         urlsWithEvents = 0
         totalEvents = 0
 
@@ -999,7 +1003,7 @@ class redfinScraper(object):
                                     durMins, minsLeft))
         if numUrls > 0:
             self.pctUrlsWithEvents = round(
-                urlsWithEvents / numUrls, 1) * 100
+                urlsWithEvents / origNumUrls, 1) * 100
         else:
             self.pctUrlsWithEvents = -999
 
@@ -1058,6 +1062,11 @@ class redfinScraper(object):
                 conn = psycopg2.connect(conn_str)
                 cur = conn.cursor()
                 continue
+            except DataError as e:
+                logging.info(str(e) + ': ' + str(row))
+                conn.rollback()
+                continue
+
         if numEvents > 0:
             self.pctEventsWritten = round(numWritten / numEvents, 2) * 100
         else:
@@ -1080,7 +1089,14 @@ class redfinScraper(object):
 
     def run(self, zipcode):
         sttm = time.time()
+        ts = dt.now().strftime('%Y-%m-%d %H:%M:%S')
         zc = zipcode
+        logging.info('%' * 100)
+        logging.info('%' * 100)
+        logging.info('Starting to process zipcode {0} at {1}'.format(
+            zc, ts).upper().center(90, ' ').center(100, '%'))
+        logging.info('%' * 100)
+        logging.info('%' * 100)
         mainClusterDict, msg = self.getUrlsByZipCode(zc)
         if not mainClusterDict:
             return
@@ -1091,7 +1107,7 @@ class redfinScraper(object):
         self.listingUrls = allZipCodeUrls
         self.writeEventsToCsv(allZipCodeUrls, self.processedUrlsFName)
         self.writeCsvToDb()
-        dur = round(time.time() - sttm / 60.0, 1)
+        dur = round((time.time() - sttm) / 60.0, 1)
         logging.info('%' * 100)
         logging.info('%' * 100)
         logging.info('Took {0} minutes to process zipcode {1}'.format(
