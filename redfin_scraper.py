@@ -261,7 +261,11 @@ class redfinScraper(object):
         scDriver, msg = self.getChromeDriver()
         if not scDriver:
             return False, msg
-        scDriver.get(url)
+        scDriver.set_page_load_timeout(160)
+        try:
+            scDriver.get(url)
+        except TimeoutException as e:
+            return False, str(e)
         self.switchToTableView(scDriver)
         mapClickable, msg = self.ensureMapClickable(scDriver, zipOrClusterId)
         if not mapClickable:
@@ -342,12 +346,12 @@ class redfinScraper(object):
 
     def formatSubClusterDict(self, complete, url, clickable,
                              count, listingUrls):
-        clusterDict = {'complete': complete,
-                       'url': url,
-                       'clickable': clickable,
-                       'count': count,
-                       'listingUrls': listingUrls}
-        return clusterDict
+        diffName = {'complete': complete,
+                    'url': url,
+                    'clickable': clickable,
+                    'count': count,
+                    'listingUrls': listingUrls}
+        return diffName
 
     def scrapeSubClusterUrls(self, IODict, mainClusterUrl, mainClusterNo,
                              numSubClusters, subClusterNo, mainClusterCount):
@@ -366,8 +370,13 @@ class redfinScraper(object):
             logging.info(
                 'Subcluster {0} Chrome instance failed to load. {1}'.format(
                     subClusterID, msg))
-            IODict[j] = self.formatSubClusterDict(
-                complete, url, clickable, count, listingUrls)
+
+            try:
+                IODict[j] = self.formatSubClusterDict(
+                    complete, url, clickable, count, listingUrls)
+            except Exception as e:
+                e
+                logging.info('FUCK YOU ' * 100)
             return
         subClusters = self.getClusters(scDriver)
         if len(subClusters) != numSubClusters:
@@ -406,7 +415,7 @@ class redfinScraper(object):
         count = self.getListingCount(scDriver)
         url = scDriver.current_url
         listingUrls = self.getAllUrls(scDriver)
-        pctObtained = round(len(listingUrls) / count * 100, 1)
+        pctObtained = round(len(listingUrls) / count * 100.0, 1)
         logging.info(
             'Subcluster {3} returned {0} of {1} ({2}%) listing urls.'.
             format(len(listingUrls), count, pctObtained, subClusterID))
@@ -436,6 +445,7 @@ class redfinScraper(object):
             parallelDict = manager.dict()
             jobs = []
             timeouts = []
+            goodJobs = []
         else:
             seriesDict = dict()
         for j in range(len(subClusters)):
@@ -464,10 +474,15 @@ class redfinScraper(object):
                     logging.info(
                         'Subcluster {0}.{1} timed out. Had to terminate.'.
                         format(i + 1, j + 1))
-            clusterDict['subClusters'] = dict(parallelDict)
+                else:
+                    goodJobs.append(j)
+            parallelDict = dict(parallelDict)
+            clusterDict['subClusters'] = dict()
             for j in timeouts:
                 clusterDict['subClusters'][j] = self.formatSubClusterDict(
                     False, None, False, None, [])
+            for j in goodJobs:
+                clusterDict['subClusters'][j] = parallelDict[j]
         else:
             clusterDict['subClusters'] = seriesDict
         subClustersDict = clusterDict['subClusters']
@@ -480,7 +495,7 @@ class redfinScraper(object):
         for j in subClustersDict.keys():
             allListingUrls += subClustersDict[j]['listingUrls']
         uniqueUrls = set(allListingUrls)
-        pctObtained = round(len(uniqueUrls) / count * 100, 3)
+        pctObtained = round(len(uniqueUrls) / count * 100.0, 1)
         clusterDict.update(
             {'subClustersOver350': subClustersOver350,
                 'numSubClustersOver350': numSubClustersOver350,
@@ -557,16 +572,18 @@ class redfinScraper(object):
             count = self.getListingCount(driver)
             mainClusterDict['clusters'][i].\
                 update({'count': count, 'url': driver.current_url})
-            if count > 345:
-                self.checkForClusters(driver)
-                self.getSubClusters(
-                    driver, mainClusterDict, i, zipcode)
-            else:
+
+            foundClusters = self.checkForClusters(driver)
+            if (count < 345) or \
+               (foundClusters is False and count >= 345):
                 listingUrls = self.getAllUrls(driver)
-                pctObtained = round(len(listingUrls) / count * 100, 1)
+                pctObtained = round(len(listingUrls) / count * 100.0, 1)
                 mainClusterDict['clusters'][i].update(
                     {'pctObtained': pctObtained,
                         'listingUrls': listingUrls})
+            else:
+                self.getSubClusters(
+                    driver, mainClusterDict, i, zipcode)
             clusterInfo = mainClusterDict['clusters'][i]
             logging.info('*' * 100)
             logging.info(
@@ -712,9 +729,12 @@ class redfinScraper(object):
         return price.encode('utf-8')
 
     def getEventSource(self, htmlEventElement):
-        source = htmlEventElement.find_element(
-            By.XPATH, './/div[@class="source-info"]/span[@class="source"]')
-        return source.text.encode('utf-8')
+        try:
+            source = htmlEventElement.find_element(
+                By.XPATH, './/div[@class="source-info"]/span[@class="source"]')
+            return source.text.encode('utf-8')
+        except (NoSuchElementException, TimeoutException):
+            return None
 
     def getEventsFromListingUrl(self, url, iter_num, total_num, sttm,
                                 eventQueue, urlList, timeoutList, eventsSaved):
@@ -1003,7 +1023,7 @@ class redfinScraper(object):
                                     durMins, minsLeft))
         if numUrls > 0:
             self.pctUrlsWithEvents = round(
-                urlsWithEvents / origNumUrls, 1) * 100
+                urlsWithEvents / origNumUrls * 100.0, 1)
         else:
             self.pctUrlsWithEvents = -999
 
@@ -1068,7 +1088,7 @@ class redfinScraper(object):
                 continue
 
         if numEvents > 0:
-            self.pctEventsWritten = round(numWritten / numEvents, 2) * 100
+            self.pctEventsWritten = round(numWritten / numEvents * 100.0, 1)
         else:
             self.pctEventsWritten = -999
         logging.info('#' * 100)
