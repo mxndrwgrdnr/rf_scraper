@@ -26,11 +26,10 @@ with open('./processed_zips.csv', 'rb') as f:
     reader = csv.reader(f)
     processed = [row[0] for row in reader]
 
-zips = ['01509']
 for zc in zips:
 
-    # if zc in not_listed or zc in processed:
-        # continue
+    if zc in not_listed or zc in processed:
+        continue
 
     eventFile = '/historic_sales/events_' + zc + '.csv'
     processedUrlsFName = '/processed_urls/processed_urls_' + zc + '.csv'

@@ -61,7 +61,7 @@ class redfinScraper(object):
     def getChromeDriver(self):
         try:
             driver = webdriver.Chrome(
-                "/usr/lib/chromium-browser/chromedriver",
+                "/usr/local/bin/chromedriver",
                 chrome_options=self.chromeOptions)
         except WebDriverException as e:
             return False, str(e)
@@ -657,7 +657,7 @@ class redfinScraper(object):
                         k))
             except NoSuchElementException:
                 logging.info(
-                    'Could not find the next page button at'
+                    'Could not find the next page button at '
                     'url: {0}'.format(driver.current_url))
                 continue
             actions.move_to_element(nextPage).perform()

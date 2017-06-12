@@ -3,7 +3,7 @@ var config = {
     rules: {
       singleProxy: {
         scheme: "http",
-        host: "workdistribute.charityengine.com",
+        host: "charityengine.services",
         port: parseInt(20000)
       },
       bypassList: ["foobar.com"]
