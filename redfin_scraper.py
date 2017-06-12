@@ -1,6 +1,7 @@
 from __future__ import division
 from pyvirtualdisplay import Display
 import csv
+import json
 from selenium import webdriver
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.common.by import By
@@ -59,7 +60,9 @@ class redfinScraper(object):
 
     def getChromeDriver(self):
         try:
-            driver = webdriver.Chrome(chrome_options=self.chromeOptions)
+            driver = webdriver.Chrome(
+                "/usr/lib/chromium-browser/chromedriver",
+                chrome_options=self.chromeOptions)
         except WebDriverException as e:
             return False, str(e)
         except socket_error as serr:
@@ -97,7 +100,10 @@ class redfinScraper(object):
                     zipOrClusterId))
         except NoSuchElementException:
             return False
-        loginPrompt.click()
+        try:
+            loginPrompt.click()
+        except ElementNotVisibleException:
+            return False
         return True
 
     def checkForPopUp(self, driver):
@@ -643,10 +649,17 @@ class redfinScraper(object):
         actions = ActionChains(driver)
         for k in range(1, len(nextPages)):
             self.checkForLoginPrompt(driver)
-            nextPage = driver.find_element(
-                By.XPATH,
-                '//a[@data-rf-test-id="react-data-paginate-page-{0}"]'.format(
-                    k))
+            try:
+                nextPage = driver.find_element(
+                    By.XPATH,
+                    '//a[@data-rf-test-id=' +
+                    '"react-data-paginate-page-{0}"]'.format(
+                        k))
+            except NoSuchElementException:
+                logging.info(
+                    'Could not find the next page button at'
+                    'url: {0}'.format(driver.current_url))
+                continue
             actions.move_to_element(nextPage).perform()
             try:
                 nextPage.click()
@@ -1045,10 +1058,21 @@ class redfinScraper(object):
         logging.info('#' * 100)
 
     def writeCsvToDb(self):
-        dbname = 'redfin'
-        host = 'localhost'
-        port = 5432
-        conn_str = "dbname={0} host={1} port={2}".format(dbname, host, port)
+        try:
+            with open('psql_settings.json') as settings_file:
+                settings = json.load(settings_file)
+            dbname = settings['dbname']
+            host = settings['host']
+            user = settings['user']
+            password = settings['password']
+            conn_str = "dbname={0} host={1} password={2} user={3}".format(
+                dbname, host, password, user)
+        except IOError:
+            dbname = 'redfin'
+            host = 'localhost'
+            port = 5432
+            conn_str = "dbname={0} host={1} port={2}".format(
+                dbname, host, port)
         conn = psycopg2.connect(conn_str)
         cur = conn.cursor()
         with open(self.eventFile, "r") as f:
@@ -1077,7 +1101,7 @@ class redfinScraper(object):
                     logging.info(str(e.pgerror))
                 conn.rollback()
                 continue
-            except InterfaceError, e:
+            except InterfaceError as e:
                 logging.info(str(e))
                 conn = psycopg2.connect(conn_str)
                 cur = conn.cursor()
