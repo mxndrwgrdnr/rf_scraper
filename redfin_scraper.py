@@ -10,11 +10,13 @@ from selenium.common.exceptions \
     import WebDriverException, NoSuchElementException, TimeoutException, \
     StaleElementReferenceException, ElementNotVisibleException
 from selenium.webdriver.common.action_chains import ActionChains
+from subprocess import call
 from itertools import izip_longest
 from datetime import datetime as dt, timedelta as td
 import logging
 import time
 import pickle
+from Queue import Empty
 from multiprocess import Process, Manager, Queue
 import psycopg2
 from psycopg2 import IntegrityError, InterfaceError, DataError
@@ -749,13 +751,16 @@ class redfinScraper(object):
         except (NoSuchElementException, TimeoutException):
             return None
 
-    def getEventsFromListingUrl(self, url, iter_num, total_num, sttm,
-                                eventQueue, urlList, timeoutList, eventsSaved):
+    def getEventsFromListingUrl(self, mode, url, eventQueue, processedUrls,
+                                timeoutList):
+        mode = self.eventMode
         numEvents = 0
+        eventsOut = []
         eventDriver, msg = self.getChromeDriver()
         if not eventDriver:
-            logging.info('Chrome could not connect to listing page {0}'.format(
-                url))
+            logging.info(
+                'Chrome could not connect to listing page {0}. {1}'.format(
+                    url, msg))
             return
         eventDriver.set_page_load_timeout(160)
         try:
@@ -769,7 +774,7 @@ class redfinScraper(object):
             return
         try:
             info = eventDriver.find_element(
-                By.XPATH, '//div[contains(@class, "main-stats inline-block")]')
+                By.XPATH, '//div[contains(@class, "HomeInfo inline-block")]')
         except NoSuchElementException:
             logging.info('No property stats detected at {0}'.format(
                 url))
@@ -818,7 +823,7 @@ class redfinScraper(object):
         try:
             sqftInfo = info.find_element(
                 By.XPATH, '''.//span[@class="sqft-label"]/..
-                /span[@class="main-font statsValue"]''').text
+                /span[@class="statsValue"]''').text
             sqft = sqftInfo.replace(',', '').encode('utf-8')
         except NoSuchElementException:
             sqft = None
@@ -878,14 +883,26 @@ class redfinScraper(object):
                     (saleDtObj is None) or
                     ((saleDtObj is not None) and
                      (curSaleDtObj < saleDtObj - td(days=14)))):
-                    eventQueue.put(
-                        staticAttrs +
-                        [saleDtStr, salePrice, None, None, saleMLS])
+                    if mode == 'parallel':
+                        eventQueue.put(
+                            staticAttrs +
+                            [saleDtStr, salePrice, None, None, saleMLS])
+                    else:
+                        eventsOut.append(
+                            staticAttrs +
+                            [saleDtStr, salePrice, None, None, saleMLS])
                     numEvents += 1
                 if i + 1 == len(historyRows):
-                    eventQueue.put(
-                        staticAttrs +
-                        [curSaleDtStr, curSalePrice, None, None, curSaleMLS])
+                    if mode == 'parallel':
+                        eventQueue.put(
+                            staticAttrs +
+                            [curSaleDtStr, curSalePrice, None, None,
+                             curSaleMLS])
+                    else:
+                        eventsOut.append(
+                            staticAttrs +
+                            [curSaleDtStr, curSalePrice, None, None,
+                             curSaleMLS])
                     numEvents += 1
                 lastEvent = 'sale'
                 saleDtStr, saleDtObj, salePrice, saleMLS = \
@@ -893,22 +910,24 @@ class redfinScraper(object):
             elif 'Listed' in historyRow.text and lastEvent == 'sale':
                 listDtStr, listDtObj = self.getEventDate(historyRow)
                 listPrice = self.getEventPrice(historyRow)
-                eventQueue.put(
-                    staticAttrs +
-                    [saleDtStr, salePrice, listDtStr, listPrice, saleMLS])
+                if mode == 'parallel':
+                    eventQueue.put(
+                        staticAttrs +
+                        [saleDtStr, salePrice, listDtStr, listPrice, saleMLS])
+                else:
+                    eventsOut.append(
+                        staticAttrs +
+                        [saleDtStr, salePrice, listDtStr, listPrice, saleMLS])
                 numEvents += 1
                 lastEvent = 'listing'
             else:
                 continue
         eventDriver.quit()
-        durMins, minsLeft = self.timeElapsedLeft(sttm, iter_num + 1, total_num)
-        if (iter_num + 1) % 10 == 0:
-            logging.info(
-                'Saved {0} total sales events from {1} listings in {2} min. '
-                'elapsed. Estimated time to completion: ~{3} min.'.format(
-                    eventsSaved.value, iter_num + 1, durMins, minsLeft))
-        urlList.append(url)
-        return
+        processedUrls.append(url)
+        if mode == 'parallel':
+            return
+        else:
+            return eventsOut
 
     def pickleClusterDict(self, clusterDict, zipcode):
         pickle.dump(clusterDict, open(
@@ -925,14 +944,14 @@ class redfinScraper(object):
         while True:
             try:
                 task = queue.get(timeout=30)
-            except Exception:
-                logging.info('eventWorker got to the end of the queue.')
+            except Empty:
+                # logging.info('eventWorker got to the end of the queue.')
                 return
-            url, i, numUrls, sttm, eventQueue, \
-                urlList, timeoutList, eventsSaved = task
+            mode, url, eventQueue, processedUrls, \
+                timeoutList = task
             self.getEventsFromListingUrl(
-                url, i, numUrls, sttm, eventQueue, urlList, timeoutList,
-                eventsSaved)
+                mode, url, eventQueue, processedUrls,
+                    timeoutList)
 
     def writeToCsvWorker(self, queue, eventsSaved):
         with open(self.eventFile, 'a+') as f:
@@ -946,11 +965,13 @@ class redfinScraper(object):
                 writer.writerow(event)
                 eventsSaved.value += 1
 
-    def writeEventsToCsv(self, urls, processedUrlsFName):
+    def writeEventsToCsv(self, urls, processedUrlsFName, batchSize=20):
         numUrls = len(urls)
         origNumUrls = numUrls
         urlsWithEvents = 0
         totalEvents = 0
+        processedListings = 0
+        numTimeouts = 0
 
         try:
             with open(processedUrlsFName, 'r') as pus:
@@ -970,47 +991,68 @@ class redfinScraper(object):
                 sttm = time.time()
 
                 if self.eventMode == 'parallel':
-                    manager = Manager()
-                    timeoutList = manager.list()
-                    urlList = manager.list(urls)
-                    queue = Queue()
-                    eventQueue = manager.Queue()
-                    eventsSaved = manager.Value('i', 0)
-                    jobs = []
-                    for i, url in enumerate(urls):
-                        queue.put(
-                            [url, i, numUrls, sttm, eventQueue, urlList,
-                             timeoutList, eventsSaved])
-                    for i in range(min(24, numUrls)):
-                        proc = Process(target=self.eventWorker, args=(queue,))
-                        proc.start()
-                        jobs.append(proc)
-                    writeProc = Process(target=self.writeToCsvWorker, args=(
-                        eventQueue, eventsSaved))
-                    time.sleep(2)
-                    writeProc.start()
-                    for j, job in enumerate(jobs):
-                        # 5 seconds per url for each process before timeout
-                        job.join(max(60, 5 * numUrls))
-                        if job.is_alive():
-                            job.terminate()
-                            logging.info(
-                                'Subprocess {0} of {1} timed out'.format(
-                                    j + 1, min(24, numUrls)))
-                    writeProc.join(max(60, 8 * numUrls))
-                    totalEvents = eventsSaved.value
-                    for url in set(list(urlList)):
-                        pUrls_writer.writerow([url])
-                    urlsWithEvents = len(set(list(urlList)))
-                    numTimeouts = len(set(list(timeoutList)))
+                    batches = [
+                        urls[x:x + batchSize]
+                        for x in xrange(0, len(urls), batchSize)]
+                    for b, batch in enumerate(batches):
+                        logging.info('Starting batch {0} of  {1}'.format(
+                            b + 1, len(batches)))
+                        manager = Manager()
+                        batchQueue = Queue()
+                        batchTimeoutList = manager.list()
+                        batchProcessedUrls = manager.list()
+                        batchEventQueue = manager.Queue()
+                        batchEventsSaved = manager.Value('i', 0)
+                        jobs = []
+                        for i, url in enumerate(batch):
+                            batchQueue.put(
+                                [self.eventMode, url, batchEventQueue,
+                                 batchProcessedUrls, batchTimeoutList])
+                        for i in range(len(batch)):
+                            proc = Process(
+                                target=self.eventWorker, args=(batchQueue,))
+                            proc.start()
+                            jobs.append(proc)
+                        writeProc = Process(
+                            target=self.writeToCsvWorker, args=(
+                                batchEventQueue, batchEventsSaved))
+                        time.sleep(2)
+                        writeProc.start()
+                        for j, job in enumerate(jobs):
+                            # 5 seconds per url for each process before timeout
+                            job.join(max(60, 5 * len(batch)))
+                            if job.is_alive():
+                                job.terminate()
+                                logging.info(
+                                    'Subprocess {0} of {1} timed out'.format(
+                                        j + 1, min(24, len(batch))))
+                        writeProc.join(max(60, 8 * len(batch)))
+                        totalEvents += batchEventsSaved.value
+                        processedListings += len(batch)
+                        for url in set(list(batchProcessedUrls)):
+                            pUrls_writer.writerow([url])
+                        urlsWithEvents += len(set(list(batchProcessedUrls)))
+                        numTimeouts += len(set(list(batchTimeoutList)))
+                        durMins, minsLeft = self.timeElapsedLeft(
+                            sttm, b + 1, len(batches))
+                        logging.info(
+                            'Saved {0} new events from {1} of {2} listings. '
+                            '\nEstimated time to '
+                            'completion: ~{3} min.'.format(
+                                batchEventsSaved.value,
+                                len(batchProcessedUrls), len(batch), minsLeft))
+                        os.system(
+                            "ps aux | grep chrome | awk ' { print $2 } ' |"
+                            " xargs kill -9")
 
-                else:
+                elif self.eventMode == 'series':
                     for i, url in enumerate(urls):
                         numEvents = 0
-                        events = self.getEventsFromListingUrl(url)
+                        events = self.getEventsFromListingUrl(
+                            self.eventMode, url, None, urls, [])
                         if events is None:
                             durMins, minsLeft = self.timeElapsedLeft(
-                                sttm, i, numUrls)
+                                sttm, i + 1, numUrls)
                             logging.info(
                                 'No sales events scraped from listing'
                                 ' {0} of {1}. Check url: {2}. {3} min.'
@@ -1026,7 +1068,7 @@ class redfinScraper(object):
                         pUrls_writer.writerow([url])
                         durMins, minsLeft = self.timeElapsedLeft(
                             sttm, i, numUrls)
-                        if (i + 1) % 10 == 0:
+                        if (i + 1) % 1 == 0:
                             logging.info(
                                 'Scraped {0} sales events from listing {1}'
                                 ' of {2}. Scraped {3} total sales events in'
@@ -1034,6 +1076,10 @@ class redfinScraper(object):
                                 ' ~{5} min.'.format(
                                     numEvents, i + 1, numUrls, totalEvents,
                                     durMins, minsLeft))
+                else:
+                    raise ValueError(
+                        'Must specify valid event scraping '
+                        'mode: ["parallel", "series"]')
         if numUrls > 0:
             self.pctUrlsWithEvents = round(
                 urlsWithEvents / origNumUrls * 100.0, 1)
@@ -1147,9 +1193,9 @@ class redfinScraper(object):
         else:
             self.mainClusterDict = mainClusterDict
             self.pickleClusterDict(mainClusterDict, zc)
-        allZipCodeUrls = mainClusterDict['listingUrls']
-        self.listingUrls = allZipCodeUrls
-        self.writeEventsToCsv(allZipCodeUrls, self.processedUrlsFName)
+        self.listingUrls = mainClusterDict['listingUrls']
+        self.writeEventsToCsv(
+            self.listingUrls, self.processedUrlsFName, batchSize=30)
         self.writeCsvToDb()
         dur = round((time.time() - sttm) / 60.0, 1)
         logging.info('%' * 100)

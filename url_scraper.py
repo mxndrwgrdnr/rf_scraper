@@ -1,19 +1,22 @@
 import csv
-import redfin_scraper
+import redfin_scraper as rs
 from pyzipcode import ZipCodeDatabase
 from datetime import datetime as dt
 from selenium.webdriver.chrome.options import Options
 import os
 
+noBrowserUI = True
 os.environ["DBUS_SESSION_BUS_ADDRESS"] = '/dev/null'
 zcdb = ZipCodeDatabase()
 zips = [zc.zip for zc in zcdb.find_zip()]
+zips = ['01510']
 sttm = dt.now().strftime('%Y%m%d-%H%M%S')
 dataDir = './data'
 chrome_options = Options()
 chrome_options.add_extension("./proxy.zip")
+# chrome_options.add_argument("--load-extension=./proxy.zip")
 chrome_options.add_argument("--ignore-certificate-errors")
-chrome_options.add_argument("--window-size=1024,768")
+# chrome_options.add_argument("--window-size=1024,768")
 chrome_options.add_argument("--start-maximized")
 chrome_options.add_argument("--disable-infobars")
 sttm = dt.now().strftime('%Y%m%d-%H%M%S')
@@ -34,8 +37,8 @@ for zc in zips:
     eventFile = '/historic_sales/events_' + zc + '.csv'
     processedUrlsFName = '/processed_urls/processed_urls_' + zc + '.csv'
 
-    rf = redfin_scraper.redfinScraper(
-        eventFile, processedUrlsFName, virtualDisplay=True,
+    rf = rs.redfinScraper(
+        eventFile, processedUrlsFName, virtualDisplay=noBrowserUI,
         subClusterMode='parallel', eventMode='parallel', timeFilter='sold-all',
         dataDir=dataDir, startTime=sttm, chromeOptions=chrome_options)
 
